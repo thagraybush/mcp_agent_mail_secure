@@ -4805,18 +4805,30 @@ def build_mcp_server() -> FastMCP:
     def _session_binding_key(ctx: Context) -> str:
         # `ctx.session_id` is a stable identifier across requests for both
         # HTTP (mcp-session-id header) and stdio (uuid stored on the
-        # in-memory session). Falls through to a generated UUID if the
-        # transport doesn't surface one — that case yields an isolated
-        # binding scope for that one request, which is the safe default.
+        # in-memory session). Falls through to a generated UUID cached on
+        # the ctx itself if the transport doesn't surface one — caching
+        # is required because `_bind_session_agent` calls into both
+        # `_session_bindings_for` and `_session_current_agents_for`, and
+        # without a stable per-ctx key those two helpers would write to
+        # different orphan UUIDs and the binding would be invisible to
+        # the next `_session_is_bound_to_agent` lookup.
         try:
             session_id = ctx.session_id
         except Exception:
             session_id = ""
-        if not session_id:
-            from uuid import uuid4 as _session_uuid4
-
-            return f"orphan:{_session_uuid4()}"
-        return session_id
+        if session_id:
+            return session_id
+        cached = getattr(ctx, "_mcp_agent_mail_orphan_key", None)
+        if isinstance(cached, str):
+            return cached
+        orphan_key = f"orphan:{uuid.uuid4()}"
+        try:
+            ctx._mcp_agent_mail_orphan_key = orphan_key  # type: ignore[attr-defined]
+        except Exception:
+            # ctx refuses attribute assignment; multi-lookup consistency
+            # degrades to "best effort" but a single lookup still works.
+            pass
+        return orphan_key
 
     def _prune_expired_session_bindings(now: float) -> None:
         if not session_binding_last_access:
