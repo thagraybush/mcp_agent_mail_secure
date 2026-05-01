@@ -207,17 +207,24 @@ else
       -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":${_HUMAN_KEY_ESCAPED},\"program\":\"gemini-cli\",\"model\":\"gemini\",\"task_description\":\"setup\"}}}" \
       "${_URL}" 2>/dev/null || echo "")
 
+  _REG_TOKEN=""
   if [[ -n "${_REGISTER_RESPONSE}" ]]; then
-    # Extract agent name from JSON response using jq or Python
+    # Extract agent name + registration_token from JSON response using jq or Python
     if command -v jq >/dev/null 2>&1; then
       _AGENT=$(echo "${_REGISTER_RESPONSE}" | jq -r '.result.content[0].text // empty' 2>/dev/null | jq -r '.name // empty' 2>/dev/null || echo "")
+      _REG_TOKEN=$(echo "${_REGISTER_RESPONSE}" | jq -r '.result.content[0].text // empty' 2>/dev/null | jq -r '.registration_token // empty' 2>/dev/null || echo "")
     else
       _AGENT=$(echo "${_REGISTER_RESPONSE}" | uv run python -c 'import sys,json; r=json.load(sys.stdin); c=r.get("result",{}).get("content",[]); print(json.loads(c[0]["text"])["name"] if c else "")' 2>/dev/null || echo "")
+      _REG_TOKEN=$(echo "${_REGISTER_RESPONSE}" | uv run python -c 'import sys,json; r=json.load(sys.stdin); c=r.get("result",{}).get("content",[]); print(json.loads(c[0]["text"]).get("registration_token","") if c else "")' 2>/dev/null || echo "")
     fi
     if [[ -n "${_AGENT}" ]]; then
       log_ok "Registered agent: ${_AGENT}"
     else
       log_warn "Could not parse agent name from response"
+    fi
+    if [[ -z "${_REG_TOKEN}" ]]; then
+      log_warn "Could not parse registration_token from register_agent response."
+      log_warn "The inbox-check hook will silently no-op until this is set (fetch_inbox auth)."
     fi
   else
     log_warn "Failed to register agent"
@@ -244,11 +251,14 @@ else
   log_warn "Could not find check_inbox.sh hook script"
 fi
 
-# Build the inbox check command with environment variables
+# Build the inbox check command with environment variables.
+# AGENT_MAIL_REGISTRATION_TOKEN is required for fetch_inbox to authenticate
+# from a hook invocation (each hook fires its own curl POST and bypasses
+# any persistent MCP-session state).
 _PROJ_DISPLAY=$(basename "$TARGET_DIR")
 _PROJ="${TARGET_DIR}"
 _MCP_DIR="${ROOT_DIR}"
-INBOX_CHECK_CMD="AGENT_MAIL_PROJECT='${TARGET_DIR}' AGENT_MAIL_AGENT='${_AGENT}' AGENT_MAIL_URL='${_URL}' AGENT_MAIL_TOKEN='${_TOKEN}' AGENT_MAIL_INTERVAL='120' '${INBOX_HOOK}'"
+INBOX_CHECK_CMD="AGENT_MAIL_PROJECT='${TARGET_DIR}' AGENT_MAIL_AGENT='${_AGENT}' AGENT_MAIL_URL='${_URL}' AGENT_MAIL_TOKEN='${_TOKEN}' AGENT_MAIL_REGISTRATION_TOKEN='${_REG_TOKEN:-}' AGENT_MAIL_INTERVAL='120' '${INBOX_HOOK}'"
 
 log_step "Updating ~/.gemini/settings.json with hooks and MCP config"
 HOME_SETTINGS="${HOME}/.gemini/settings.json"

@@ -176,17 +176,24 @@ if readiness_poll "${_HTTP_HOST}" "${_HTTP_PORT}" "/health/readiness" 3 0.5; the
       -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":${_HUMAN_KEY_ESCAPED},\"program\":\"codex-cli\",\"model\":\"gpt-5-codex\",\"task_description\":\"setup\"}}}" \
       "${_URL}" 2>/dev/null || echo "")
 
+  _REG_TOKEN=""
   if [[ -n "${_REGISTER_RESPONSE}" ]]; then
-    # Extract agent name from JSON response using jq or Python
+    # Extract agent name + registration_token from JSON response using jq or Python
     if command -v jq >/dev/null 2>&1; then
       _AGENT=$(echo "${_REGISTER_RESPONSE}" | jq -r '.result.content[0].text // empty' 2>/dev/null | jq -r '.name // empty' 2>/dev/null || echo "")
+      _REG_TOKEN=$(echo "${_REGISTER_RESPONSE}" | jq -r '.result.content[0].text // empty' 2>/dev/null | jq -r '.registration_token // empty' 2>/dev/null || echo "")
     else
       _AGENT=$(echo "${_REGISTER_RESPONSE}" | uv run python -c 'import sys,json; r=json.load(sys.stdin); c=r.get("result",{}).get("content",[]); print(json.loads(c[0]["text"])["name"] if c else "")' 2>/dev/null || echo "")
+      _REG_TOKEN=$(echo "${_REGISTER_RESPONSE}" | uv run python -c 'import sys,json; r=json.load(sys.stdin); c=r.get("result",{}).get("content",[]); print(json.loads(c[0]["text"]).get("registration_token","") if c else "")' 2>/dev/null || echo "")
     fi
     if [[ -n "${_AGENT}" ]]; then
       log_ok "Registered agent: ${_AGENT}"
     else
       log_warn "Could not parse agent name from response"
+    fi
+    if [[ -z "${_REG_TOKEN}" ]]; then
+      log_warn "Could not parse registration_token from register_agent response."
+      log_warn "The notify hook will silently no-op until this is set (fetch_inbox auth)."
     fi
   else
     log_warn "Failed to register agent"
@@ -218,7 +225,10 @@ else
   log_warn "Could not find codex_notify.sh script"
 fi
 
-# Build the notify command with environment variables wrapper
+# Build the notify command with environment variables wrapper.
+# AGENT_MAIL_REGISTRATION_TOKEN is required for fetch_inbox to authenticate
+# from a notify invocation (each fires its own curl POST and bypasses any
+# persistent MCP-session state).
 NOTIFY_WRAPPER="${HOOKS_DIR}/notify_wrapper.sh"
 write_atomic "$NOTIFY_WRAPPER" <<SH
 #!/usr/bin/env bash
@@ -226,6 +236,7 @@ export AGENT_MAIL_PROJECT='${TARGET_DIR}'
 export AGENT_MAIL_AGENT='${_AGENT}'
 export AGENT_MAIL_URL='${_URL}'
 export AGENT_MAIL_TOKEN='${_TOKEN}'
+export AGENT_MAIL_REGISTRATION_TOKEN='${_REG_TOKEN:-}'
 export AGENT_MAIL_INTERVAL='120'
 exec '${NOTIFY_HOOK}' "\$@"
 SH

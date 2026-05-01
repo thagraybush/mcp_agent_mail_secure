@@ -11,11 +11,14 @@
 #   {"type":"agent-turn-complete","thread-id":"...","turn-id":"...","cwd":"...","input-messages":[...],"last-assistant-message":"..."}
 #
 # Environment variables:
-#   AGENT_MAIL_PROJECT   - Project key (absolute path)
-#   AGENT_MAIL_AGENT     - Agent name
-#   AGENT_MAIL_URL       - Server URL (default: http://127.0.0.1:8765/api/)
-#   AGENT_MAIL_TOKEN     - Bearer token
-#   AGENT_MAIL_INTERVAL  - Minimum seconds between checks (default: 120)
+#   AGENT_MAIL_PROJECT             - Project key (absolute path)
+#   AGENT_MAIL_AGENT               - Agent name
+#   AGENT_MAIL_URL                 - Server URL (default: http://127.0.0.1:8765/api/)
+#   AGENT_MAIL_TOKEN               - Principal bearer token (HTTP Authorization header)
+#   AGENT_MAIL_REGISTRATION_TOKEN  - Per-agent registration_token. Required for fetch_inbox
+#                                    when called outside an authenticated MCP session, which
+#                                    is always the case here (each notify fires its own POST).
+#   AGENT_MAIL_INTERVAL            - Minimum seconds between checks (default: 120)
 
 # Don't use set -e because grep returns 1 when no match
 set -uo pipefail
@@ -29,6 +32,7 @@ PROJECT="${AGENT_MAIL_PROJECT:-}"
 AGENT="${AGENT_MAIL_AGENT:-}"
 URL="${AGENT_MAIL_URL:-http://127.0.0.1:8765/api/}"
 TOKEN="${AGENT_MAIL_TOKEN:-}"
+REG_TOKEN="${AGENT_MAIL_REGISTRATION_TOKEN:-}"
 INTERVAL="${AGENT_MAIL_INTERVAL:-120}"
 
 # Require project and agent
@@ -70,6 +74,15 @@ json_escape() {
 PROJECT_JSON=$(json_escape "${PROJECT}")
 AGENT_JSON=$(json_escape "${AGENT}")
 
+# Build fetch_inbox args. Include registration_token only if present so the
+# args shape stays backward-compatible with servers that don't enforce it.
+if [[ -n "${REG_TOKEN}" ]]; then
+  REG_TOKEN_JSON=$(json_escape "${REG_TOKEN}")
+  ARGS_JSON="{\"project_key\":${PROJECT_JSON},\"agent_name\":${AGENT_JSON},\"registration_token\":${REG_TOKEN_JSON},\"limit\":10,\"include_bodies\":false}"
+else
+  ARGS_JSON="{\"project_key\":${PROJECT_JSON},\"agent_name\":${AGENT_JSON},\"limit\":10,\"include_bodies\":false}"
+fi
+
 # Build curl command with proper auth
 CURL_ARGS=(-s --max-time 3 -X POST "${URL}" -H "Content-Type: application/json")
 if [[ -n "${TOKEN}" ]]; then
@@ -78,7 +91,7 @@ fi
 
 # Fetch inbox via MCP
 RESPONSE=$(curl "${CURL_ARGS[@]}" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\"project_key\":${PROJECT_JSON},\"agent_name\":${AGENT_JSON},\"limit\":10,\"include_bodies\":false}}}" 2>/dev/null || echo "")
+  -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":${ARGS_JSON}}}" 2>/dev/null || echo "")
 
 # Check if we got a valid response with messages
 if [[ -z "${RESPONSE}" ]]; then
@@ -90,17 +103,41 @@ if echo "${RESPONSE}" | grep -q '"isError":true'; then
   exit 0
 fi
 
-# Count messages (look for "subject" in the response which indicates message objects)
-MSG_COUNT=$(echo "${RESPONSE}" | grep -c '"subject"' 2>/dev/null || echo "0")
-MSG_COUNT="${MSG_COUNT//[^0-9]/}"  # Strip any non-numeric chars
+# Count total + urgent messages by parsing JSON. Robust against single-line
+# responses (where `grep -c '"subject"'` returned 1 regardless of count).
+COUNTS=$(printf '%s' "${RESPONSE}" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    result = d.get("result", {})
+    msgs = result.get("structuredContent", {}).get("result")
+    if not isinstance(msgs, list):
+        content = result.get("content") or []
+        if content and isinstance(content[0], dict):
+            text = content[0].get("text") or ""
+            try:
+                msgs = json.loads(text)
+            except Exception:
+                msgs = []
+    if not isinstance(msgs, list):
+        print("0 0")
+        sys.exit(0)
+    total = len(msgs)
+    urgent = sum(
+        1 for m in msgs
+        if isinstance(m, dict) and m.get("importance") in ("urgent", "high")
+    )
+    print(f"{total} {urgent}")
+except Exception:
+    print("0 0")
+' 2>/dev/null || echo "0 0")
+
+MSG_COUNT="${COUNTS%% *}"
+URGENT_COUNT="${COUNTS##* }"
 MSG_COUNT="${MSG_COUNT:-0}"
+URGENT_COUNT="${URGENT_COUNT:-0}"
 
 if [[ "${MSG_COUNT}" -gt 0 ]]; then
-  # Check for urgent messages (use -E for extended regex portability)
-  URGENT_COUNT=$(echo "${RESPONSE}" | grep -Ec '"importance":"(urgent|high)"' 2>/dev/null || echo "0")
-  URGENT_COUNT="${URGENT_COUNT//[^0-9]/}"
-  URGENT_COUNT="${URGENT_COUNT:-0}"
-
   echo ""
   echo "=== INBOX REMINDER ==="
   if [[ ${URGENT_COUNT} -gt 0 ]]; then
