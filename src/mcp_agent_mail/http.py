@@ -2729,6 +2729,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 project={"slug": prow[1], "human_key": prow[2]},
                 message=message_payload,
                 recipients=recipients,
+                ack_summary=ack_summary,
                 thread_items=thread_items,
                 commit_sha=commit_sha,
             )

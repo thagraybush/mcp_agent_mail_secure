@@ -102,7 +102,28 @@
     <!-- Recipients -->
     {% if recipients %}
       <div class="border-t border-slate-200 dark:border-slate-700 pt-6">
-        <h3 class="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-3">Recipients</h3>
+        <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+          <h3 class="text-sm font-semibold text-slate-700 dark:text-slate-300">Recipients</h3>
+          {% if ack_summary %}
+            <div class="flex items-center gap-2 text-xs">
+              <span class="inline-flex items-center gap-1.5 px-2.5 py-1 bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-full">
+                <i data-lucide="eye" class="w-3.5 h-3.5"></i>
+                Read by {{ ack_summary.read }} of {{ ack_summary.total }}
+              </span>
+              {% if ack_summary.ack_required %}
+                <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full
+                  {% if ack_summary.acked == ack_summary.total %}
+                    bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300
+                  {% else %}
+                    bg-warning-100 dark:bg-warning-900/30 text-warning-700 dark:text-warning-300
+                  {% endif %}">
+                  <i data-lucide="check-circle-2" class="w-3.5 h-3.5"></i>
+                  Acked by {{ ack_summary.acked }} of {{ ack_summary.total }}
+                </span>
+              {% endif %}
+            </div>
+          {% endif %}
+        </div>
         <div class="flex flex-wrap gap-2">
           {% for r in recipients %}
             <span class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium
@@ -112,7 +133,8 @@
                 bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300
               {% elif r.kind == 'bcc' %}
                 bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400
-              {% endif %}">
+              {% endif %}"
+              title="{% if r.read_ts %}Read {{ r.read_ts }}{% else %}Unread{% endif %}{% if r.ack_ts %} • Acked {{ r.ack_ts }}{% endif %}">
               {% if r.kind == 'to' %}
                 <i data-lucide="mail" class="w-3.5 h-3.5"></i>
               {% elif r.kind == 'cc' %}
@@ -122,6 +144,13 @@
               {% endif %}
               <span class="uppercase text-xs font-bold">{{ r.kind }}</span>
               <span>{{ r.name }}</span>
+              {% if r.ack_ts %}
+                <i data-lucide="check-circle-2" class="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400"
+                   data-tippy-content="Acked {{ r.ack_ts }}"></i>
+              {% elif r.read_ts %}
+                <i data-lucide="eye" class="w-3.5 h-3.5 text-slate-500 dark:text-slate-400"
+                   data-tippy-content="Read {{ r.read_ts }}"></i>
+              {% endif %}
             </span>
           {% endfor %}
         </div>
