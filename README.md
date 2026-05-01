@@ -2101,7 +2101,8 @@ Common variables you may set:
 | `ACK_ESCALATION_CLAIM_EXCLUSIVE` | `false` | Make escalation file reservation exclusive |
 | `ACK_ESCALATION_CLAIM_HOLDER_NAME` |  | Ops agent name to own escalation file reservations |
 | `CONTACT_ENFORCEMENT_ENABLED` | `true` | Enforce contact policy before messaging |
-| `CONTACT_AUTO_TTL_SECONDS` | `86400` | TTL for auto-approved contacts (1 day) |
+| `CONTACT_AUTO_TTL_SECONDS` | `86400` | TTL for in-session auto-approved contact links and the "recent contact" recency window (1 day) |
+| `CONTACT_PENDING_TTL_SECONDS` | `604800` | TTL for the *pending* contact-request fallback created by `send_message(auto_contact_if_blocked=True)` when in-session auto-approval is not possible — i.e. how long an async human approver has to respond (7 days) |
 | `CONTACT_AUTO_RETRY_ENABLED` | `true` | Auto-retry contact requests on policy violations |
 | `MESSAGING_AUTO_REGISTER_RECIPIENTS` | `true` | Automatically create missing local recipients during `send_message` and retry routing |
 | `MESSAGING_AUTO_HANDSHAKE_ON_BLOCK` | `true` | When contact policy blocks delivery, attempt a contact handshake (auto-accept) and retry |

@@ -7179,6 +7179,9 @@ def build_mcp_server() -> FastMCP:
                                     )
                                     auto_approved.append(nm)
                                 else:
+                                    # Pending fallback path — async human may take days to approve,
+                                    # so use the longer pending TTL (default 7 days) rather than
+                                    # the in-session auto-approval TTL (default 24h).
                                     await request_tool.run(
                                         {
                                             "ctx": ctx,
@@ -7186,7 +7189,7 @@ def build_mcp_server() -> FastMCP:
                                             "from_agent": sender.name,
                                             "to_agent": nm,
                                             "reason": "auto contact request created by send_message",
-                                            "ttl_seconds": int(settings_local.contact_auto_ttl_seconds),
+                                            "ttl_seconds": int(settings_local.contact_pending_ttl_seconds),
                                             "format": "json",
                                         }
                                     )
@@ -7274,7 +7277,7 @@ def build_mcp_server() -> FastMCP:
                                             "project_key": project.human_key,
                                             "from_agent": sender.name,
                                             "to_agent": nm,
-                                            "ttl_seconds": int(settings_local.contact_auto_ttl_seconds),
+                                            "ttl_seconds": int(settings_local.contact_pending_ttl_seconds),
                                         },
                                     }
                                 )
@@ -7557,6 +7560,9 @@ def build_mcp_server() -> FastMCP:
                                         for route_kind in sorted(route_kinds):
                                             approved_external_routes.append((display_target, route_kind))
                                     else:
+                                        # Pending fallback path — async human may take days to approve,
+                                        # so use the longer pending TTL (default 7 days) rather than
+                                        # the in-session auto-approval TTL (default 24h).
                                         await request_tool.run(
                                             {
                                                 "ctx": ctx,
@@ -7565,7 +7571,7 @@ def build_mcp_server() -> FastMCP:
                                                 "to_agent": nm,
                                                 "to_project": target_proj.human_key or target_proj.slug,
                                                 "reason": "auto contact request created by send_message",
-                                                "ttl_seconds": int(settings_local.contact_auto_ttl_seconds),
+                                                "ttl_seconds": int(settings_local.contact_pending_ttl_seconds),
                                                 "register_if_missing": True,
                                                 "program": sender.program,
                                                 "model": sender.model,
@@ -7687,7 +7693,7 @@ def build_mcp_server() -> FastMCP:
                                             "from_agent": sender.name,
                                             "to_agent": nm,
                                             "to_project": label,
-                                            "ttl_seconds": int(settings_local.contact_auto_ttl_seconds),
+                                            "ttl_seconds": int(settings_local.contact_pending_ttl_seconds),
                                             "register_if_missing": True,
                                             "program": sender.program,
                                             "model": sender.model,

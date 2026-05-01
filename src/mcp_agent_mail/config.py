@@ -215,7 +215,18 @@ class Settings:
     ack_escalation_claim_holder_name: str
     # Contacts/links
     contact_enforcement_enabled: bool
+    # TTL for in-session auto-approved contact links and the
+    # "recent contact" recency window used by messaging policy.
+    # Short by design (default 24h) — auto-approval is a session-scoped
+    # privilege.
     contact_auto_ttl_seconds: int
+    # TTL for the *pending* contact-request fallback created by
+    # send_message(auto_contact_if_blocked=True) when in-session
+    # auto-approval is not possible. Async human approvers may not
+    # reach the inbox within 24h, so default this to 7 days — matching
+    # the explicit `request_contact()` default and giving the receiver
+    # a realistic window to respond.
+    contact_pending_ttl_seconds: int
     contact_auto_retry_enabled: bool
     # Logging
     log_rich_enabled: bool
@@ -466,6 +477,7 @@ def _build_settings() -> Settings:
         log_include_trace=_bool(decouple_config("LOG_INCLUDE_TRACE", default="false"), default=False),
         contact_enforcement_enabled=_bool(decouple_config("CONTACT_ENFORCEMENT_ENABLED", default="true"), default=True),
         contact_auto_ttl_seconds=_int(decouple_config("CONTACT_AUTO_TTL_SECONDS", default="86400"), default=86400),
+        contact_pending_ttl_seconds=_int(decouple_config("CONTACT_PENDING_TTL_SECONDS", default="604800"), default=604800),
         contact_auto_retry_enabled=_bool(decouple_config("CONTACT_AUTO_RETRY_ENABLED", default="true"), default=True),
         log_json_enabled=_bool(decouple_config("LOG_JSON_ENABLED", default="false"), default=False),
         output_format_default=decouple_config("MCP_AGENT_MAIL_OUTPUT_FORMAT", default="").strip().lower(),
