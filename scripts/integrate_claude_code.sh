@@ -152,13 +152,20 @@ if [[ ${_SERVER_AVAILABLE} -eq 1 ]]; then
       -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{${_REGISTER_ARGS}}}}" \
       "${_URL}" 2>/dev/null || echo "")
 
+  _REG_TOKEN=""
   if [[ -n "${_REGISTER_RESPONSE}" ]]; then
     _AGENT=$(extract_registered_agent_name "${_REGISTER_RESPONSE}")
+    _REG_TOKEN=$(extract_registered_registration_token "${_REGISTER_RESPONSE}")
     if [[ -n "${_AGENT}" ]]; then
       log_ok "Registered agent: ${_AGENT}"
       persist_agent_identity_file "${ROOT_DIR}" "${_AGENT}" "${TARGET_DIR}"
     else
       log_warn "Could not parse agent name from response"
+    fi
+    if [[ -z "${_REG_TOKEN}" ]]; then
+      log_warn "Could not parse registration_token from register_agent response."
+      log_warn "The PostToolUse(Bash) inbox-check hook will silently no-op until this is set."
+      log_warn "Re-run this integrator after confirming the server returns 'registration_token' in register_agent."
     fi
   else
     log_warn "Failed to register agent"
@@ -175,8 +182,14 @@ fi
 
 log_step "Writing MCP server config and hooks (merge, not overwrite)"
 
-# Build the inbox check command with environment variables
-INBOX_CHECK_CMD="AGENT_MAIL_PROJECT='${TARGET_DIR}' AGENT_MAIL_AGENT='${_AGENT}' AGENT_MAIL_URL='${_URL}' AGENT_MAIL_TOKEN='${_TOKEN}' AGENT_MAIL_INTERVAL='120' '${INBOX_HOOK}'"
+# Build the inbox check command with environment variables.
+#
+# AGENT_MAIL_REGISTRATION_TOKEN is required for fetch_inbox to authenticate
+# from a PostToolUse hook (each hook fires its own curl POST and bypasses
+# any persistent MCP-session state). AGENT_MAIL_HOOK_FORMAT=json makes the
+# reminder land in the agent's next-turn system-reminder context — plain
+# stdout is shown to the human in the terminal but never reaches the agent.
+INBOX_CHECK_CMD="AGENT_MAIL_PROJECT='${TARGET_DIR}' AGENT_MAIL_AGENT='${_AGENT}' AGENT_MAIL_URL='${_URL}' AGENT_MAIL_TOKEN='${_TOKEN}' AGENT_MAIL_REGISTRATION_TOKEN='${_REG_TOKEN}' AGENT_MAIL_HOOK_FORMAT='json' AGENT_MAIL_INTERVAL='120' '${INBOX_HOOK}'"
 
 # ============================================================================
 # settings.json: HOOKS ONLY (no secrets, git-tracked)
