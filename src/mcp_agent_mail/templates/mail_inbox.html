@@ -123,6 +123,18 @@
                 class="px-4 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm">
           <i data-lucide="mail" class="w-4 h-4"></i>
           <span>Unread</span>
+          <template x-if="unreadCount > 0">
+            <span class="px-1.5 py-0.5 bg-white/20 rounded-full text-xs font-bold" x-text="unreadCount"></span>
+          </template>
+        </button>
+        <button @click="activeFilter = 'needs_ack'; filterMessages()"
+                :class="activeFilter === 'needs_ack' ? 'bg-warning-600 text-white ring-2 ring-warning-500 ring-offset-2 dark:ring-offset-slate-900' : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700'"
+                class="px-4 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 shadow-sm">
+          <i data-lucide="bell" class="w-4 h-4"></i>
+          <span>Needs ack</span>
+          <template x-if="needsAckCount > 0">
+            <span class="px-1.5 py-0.5 bg-white/20 rounded-full text-xs font-bold" x-text="needsAckCount"></span>
+          </template>
         </button>
         <button @click="activeFilter = 'urgent'; filterMessages()"
                 :class="activeFilter === 'urgent' ? 'bg-danger-600 text-white ring-2 ring-danger-500 ring-offset-2 dark:ring-offset-slate-900' : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700'"
@@ -174,7 +186,8 @@
   <template x-if="filteredItems.length > 0">
     <div class="space-y-3">
       <template x-for="(item, index) in filteredItems" :key="item.id">
-        <div class="bg-white dark:bg-slate-800 rounded-xl shadow-soft border-2 border-slate-200 dark:border-slate-700 hover:shadow-medium hover:border-primary-300 dark:hover:border-primary-700 transition-all duration-300 transform hover:-translate-y-0.5 overflow-hidden stagger-item"
+        <div class="bg-white dark:bg-slate-800 rounded-xl shadow-soft border-2 transition-all duration-300 transform hover:-translate-y-0.5 hover:shadow-medium hover:border-primary-300 dark:hover:border-primary-700 overflow-hidden stagger-item"
+             :class="item.unread ? 'border-primary-300 dark:border-primary-700 bg-primary-50/30 dark:bg-primary-900/10' : 'border-slate-200 dark:border-slate-700'"
              :style="`animation-delay: ${Math.min(index * 0.05, 1.0)}s;`">
           <div class="flex items-start p-6 gap-4">
             <!-- Checkbox for bulk selection -->
@@ -221,6 +234,28 @@
 
                 <!-- Badges and Status -->
                 <div class="flex items-center gap-2 ml-4">
+                  <!-- Read/Ack state -->
+                  <template x-if="item.unread">
+                    <span class="px-2.5 py-1 bg-primary-100 dark:bg-primary-900/40 text-primary-700 dark:text-primary-300 text-xs font-bold rounded-full flex items-center gap-1.5">
+                      <span class="w-1.5 h-1.5 bg-primary-600 dark:bg-primary-400 rounded-full"></span>
+                      Unread
+                    </span>
+                  </template>
+                  <template x-if="!item.unread && item.needs_ack">
+                    <span class="px-2.5 py-1 bg-warning-100 dark:bg-warning-900/30 text-warning-700 dark:text-warning-300 text-xs font-semibold rounded-full flex items-center gap-1.5"
+                          data-tippy-content="ack_required is set on this message and you have not acknowledged it yet">
+                      <i data-lucide="bell" class="w-3.5 h-3.5"></i>
+                      Needs ack
+                    </span>
+                  </template>
+                  <template x-if="item.acked">
+                    <span class="px-2.5 py-1 bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300 text-xs font-medium rounded-full flex items-center gap-1.5"
+                          data-tippy-content="Acknowledged">
+                      <i data-lucide="check-circle-2" class="w-3.5 h-3.5"></i>
+                      Acked
+                    </span>
+                  </template>
+
                   <!-- Importance Badge -->
                   <template x-if="item.importance === 'urgent'">
                     <span class="px-3 py-1.5 bg-danger-100 dark:bg-danger-900/30 text-danger-700 dark:text-danger-300 text-xs font-semibold rounded-full flex items-center gap-1.5 badge-pulse">
@@ -334,8 +369,12 @@
 
       // Computed
       get unreadCount() {
-        // In a real implementation, this would filter items marked as unread
-        return 0;
+        // Server-supplied: item.unread is true when message_recipients.read_ts IS NULL.
+        return this.items.reduce((n, item) => n + (item.unread ? 1 : 0), 0);
+      },
+      get needsAckCount() {
+        // ack_required messages still awaiting ack from this recipient.
+        return this.items.reduce((n, item) => n + (item.needs_ack ? 1 : 0), 0);
       },
 
       init() {
@@ -360,8 +399,10 @@
         // Apply filter
         switch (this.activeFilter) {
           case 'unread':
-            // In real implementation, filter by unread status
-            // filtered = filtered.filter(item => item.unread);
+            filtered = filtered.filter(item => item.unread);
+            break;
+          case 'needs_ack':
+            filtered = filtered.filter(item => item.needs_ack);
             break;
           case 'urgent':
             filtered = filtered.filter(item =>

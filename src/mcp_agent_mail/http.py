@@ -2525,7 +2525,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         sp.slug AS sender_project_slug,
                         m.created_ts,
                         m.importance,
-                        m.thread_id
+                        m.thread_id,
+                        m.ack_required,
+                        mr.read_ts,
+                        mr.ack_ts
                     FROM messages m
                     JOIN message_recipients mr ON mr.message_id = m.id
                     JOIN agents a ON a.id = mr.agent_id
@@ -2547,6 +2550,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         sender_project_human_key=r["sender_project_name"],
                         sender_project_slug=r["sender_project_slug"],
                     )
+                    read_ts = r["read_ts"]
+                    ack_ts = r["ack_ts"]
+                    ack_required = bool(r["ack_required"])
                     item = {
                         "id": r["id"],
                         "subject": r["subject"],
@@ -2554,6 +2560,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         "created": str(r["created_ts"]),
                         "importance": r["importance"],
                         "thread_id": r["thread_id"],
+                        "ack_required": ack_required,
+                        "read_ts": str(read_ts) if read_ts else None,
+                        "ack_ts": str(ack_ts) if ack_ts else None,
+                        "unread": read_ts is None,
+                        "needs_ack": ack_required and ack_ts is None,
+                        "acked": ack_ts is not None,
                     }
                     item.update(sender_meta)
                     items.append(item)
@@ -2595,7 +2607,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 sp.slug AS sender_project_slug,
                                 m.created_ts,
                                 m.importance,
-                                m.thread_id
+                                m.thread_id,
+                                m.ack_required
                             FROM messages m
                             JOIN agents s ON s.id = m.sender_id
                             LEFT JOIN projects sp ON sp.id = s.project_id
@@ -2609,11 +2622,30 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     return await _render("error.html", message="Message not found")
                 recs = await session.execute(
                     text(
-                        "SELECT a.name, mr.kind FROM message_recipients mr JOIN agents a ON a.id = mr.agent_id WHERE mr.message_id = :mid"
+                        "SELECT a.name, mr.kind, mr.read_ts, mr.ack_ts "
+                        "FROM message_recipients mr JOIN agents a ON a.id = mr.agent_id "
+                        "WHERE mr.message_id = :mid"
                     ),
                     {"mid": mid},
                 )
-                recipients = [{"name": r[0], "kind": r[1]} for r in recs.fetchall()]
+                recipients = [
+                    {
+                        "name": r[0],
+                        "kind": r[1],
+                        "read_ts": str(r[2]) if r[2] else None,
+                        "ack_ts": str(r[3]) if r[3] else None,
+                    }
+                    for r in recs.fetchall()
+                ]
+                ack_required_msg = bool(mrow["ack_required"])
+                ack_count = sum(1 for r in recipients if r["ack_ts"])
+                read_count = sum(1 for r in recipients if r["read_ts"])
+                ack_summary = {
+                    "ack_required": ack_required_msg,
+                    "total": len(recipients),
+                    "read": read_count,
+                    "acked": ack_count,
+                }
                 # Find thread messages if thread_id is set
                 thread_items: list[dict] = []
                 th = mrow["thread_id"]
