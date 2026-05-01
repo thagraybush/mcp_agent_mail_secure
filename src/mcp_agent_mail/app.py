@@ -6753,6 +6753,23 @@ def build_mcp_server() -> FastMCP:
         topic : Optional[str]
             Optional topic tag (alphanumeric + hyphens, max 64 chars). Stored on the message
             for topic-based filtering via fetch_inbox(topic=...) or fetch_topic().
+        auto_contact_if_blocked : Optional[bool]
+            When ``True`` (and contact policy blocks delivery to one or more recipients), the
+            server will attempt to resolve the block automatically:
+
+            - If the recipient is already authenticated in the **same MCP session**, run
+              ``macro_contact_handshake(..., auto_accept=True)`` to approve the link in-band.
+              The current send proceeds normally and the message is delivered.
+            - Otherwise, fall back to creating a **pending** ``request_contact`` aimed at the
+              recipient. This call then **fails loud** with ``CONTACT_REQUIRED`` carrying
+              ``auto_contact_requested`` in ``data``. **The message body is not queued** —
+              once the recipient approves the contact (``respond_contact(..., accept=True)``),
+              the sender must re-call ``send_message`` to actually deliver the payload.
+
+            Defaults to the server-wide ``MESSAGING_AUTO_HANDSHAKE_ON_BLOCK`` setting (true
+            unless overridden). The pending-request TTL is governed by
+            ``CONTACT_PENDING_TTL_SECONDS`` (default 7 days, separate from the in-session
+            auto-approval TTL ``CONTACT_AUTO_TTL_SECONDS``).
 
         Returns
         -------

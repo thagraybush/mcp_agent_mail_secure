@@ -1739,7 +1739,7 @@ Use `set_contact_policy(project_key, agent_name, policy)` to update.
 - `respond_contact(project_key, to_agent, from_agent, accept, ttl_seconds?, registration_token?)` approves or denies; approval grants messaging until expiry.
 - `list_contacts(project_key, agent_name)` surfaces outbound links with target projects and audit flags for expiry/messageability.
 
-Auth note: these tools require either an agent already authenticated in the current MCP session, or the relevant `registration_token`. `send_message(..., auto_contact_if_blocked=true)` now creates pending contact requests by default; it only auto-approves when both agents are already authenticated in the same MCP session.
+Auth note: these tools require either an agent already authenticated in the current MCP session, or the relevant `registration_token`. `send_message(..., auto_contact_if_blocked=true)` only auto-approves when both agents are already authenticated in the same MCP session; otherwise it creates a pending `request_contact` and **fails loud** with `CONTACT_REQUIRED` (the underlying message body is *not* queued — once the recipient approves, the sender must re-call `send_message` to actually deliver the payload).
 `macro_contact_handshake(..., auto_accept=true)` follows the same rule for new approvals: it only auto-approves when the target agent is already authenticated in the current MCP session or when `target_registration_token` is supplied explicitly. If the link is already approved, the macro reuses that approval. Otherwise the request remains pending and the macro reports a `response_error`.
 
 ### Auto-allow heuristics (no explicit request required)
