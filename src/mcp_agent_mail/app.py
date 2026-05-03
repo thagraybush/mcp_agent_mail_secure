@@ -6400,6 +6400,7 @@ def build_mcp_server() -> FastMCP:
         task_description: str = "",
         attachments_policy: str = "auto",
         format: Optional[str] = None,
+        return_registration_token: bool = True,
     ) -> dict[str, Any]:
         """
         Create a new, unique agent identity and persist its profile to Git.
@@ -6423,10 +6424,24 @@ def build_mcp_server() -> FastMCP:
         - Spawning a brand new worker agent that should not overwrite an existing profile.
         - Temporary task-specific identities (e.g., short-lived refactor assistants).
 
+        Parameters
+        ----------
+        return_registration_token : bool, default True
+            When True (default, current behaviour), the response includes the
+            freshly-minted `registration_token`. When False, the token is omitted
+            from the tool result so transcript-visible MCP sessions can satisfy
+            a "do not echo secrets into scrollback" contract; the agent is still
+            bound to the current MCP session via `_bind_session_agent`, so
+            follow-up calls in the same session can authenticate without
+            ever surfacing the token. The token still exists on the server
+            and can be retrieved or rotated through the normal admin paths.
+            See issue #154.
+
         Returns
         -------
         dict
-            { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }
+            { id, name, program, model, task_description, inception_ts, last_active_ts, project_id,
+              registration_token? }
 
         Examples
         --------
@@ -6442,6 +6457,15 @@ def build_mcp_server() -> FastMCP:
         {"jsonrpc":"2.0","id":"c1","method":"tools/call","params":{"name":"create_agent_identity","arguments":{
           "project_key":"/data/projects/backend","program":"codex-cli","model":"gpt5-codex","name_hint":"GreenCastle",
           "task_description":"DB migration spike"
+        }}}
+        ```
+
+        Transcript-safe creation (issue #154) — omit the token from the
+        visible tool result and rely on session binding for follow-ups:
+        ```json
+        {"jsonrpc":"2.0","id":"c3","method":"tools/call","params":{"name":"create_agent_identity","arguments":{
+          "project_key":"/data/projects/backend","program":"codex-cli","model":"gpt5",
+          "return_registration_token":false
         }}}
         ```
         """
@@ -6479,7 +6503,13 @@ def build_mcp_server() -> FastMCP:
         _bind_session_agent(ctx, project, agent)
         await ctx.info(f"Created new agent identity '{agent.name}' for project '{project.human_key}'.")
         result = _agent_to_dict(agent)
-        result["registration_token"] = token
+        if return_registration_token:
+            result["registration_token"] = token
+        else:
+            # Caller opted out of token echo (issue #154). The token still
+            # exists server-side; the agent is bound to this MCP session so
+            # follow-up calls can authenticate without ever surfacing it.
+            result["registration_token_returned"] = False
         return result
 
     @mcp.tool(name="list_window_identities")

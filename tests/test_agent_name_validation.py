@@ -473,6 +473,57 @@ async def test_create_agent_identity_coerces_invalid_hint(isolated_env):
 
 
 @pytest.mark.asyncio
+async def test_create_agent_identity_returns_token_by_default(isolated_env):
+    """Default behavior preserves existing contract (issue #154)."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/test/token-default"})
+        result = await client.call_tool(
+            "create_agent_identity",
+            {
+                "project_key": "/test/token-default",
+                "program": "test",
+                "model": "test",
+            },
+        )
+        assert "registration_token" in result.data, (
+            "Default response must include registration_token for backwards compatibility"
+        )
+        assert isinstance(result.data["registration_token"], str)
+        assert result.data["registration_token"], "Token must be non-empty"
+        assert "registration_token_returned" not in result.data, (
+            "The opt-out flag should not appear when the token is included"
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_agent_identity_omits_token_when_opted_out(isolated_env):
+    """`return_registration_token=False` keeps the token off the wire (issue #154)."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/test/token-opt-out"})
+        result = await client.call_tool(
+            "create_agent_identity",
+            {
+                "project_key": "/test/token-opt-out",
+                "program": "test",
+                "model": "test",
+                "return_registration_token": False,
+            },
+        )
+        assert "registration_token" not in result.data, (
+            "Opt-out caller must not see registration_token in tool result"
+        )
+        assert result.data.get("registration_token_returned") is False, (
+            "Result must explicitly signal that the token was withheld"
+        )
+        # The agent must still be fully created and the response must still
+        # carry enough metadata for the caller to identify the new identity.
+        for required_field in ("id", "name", "program", "model"):
+            assert required_field in result.data, f"Missing required field {required_field}"
+
+
+@pytest.mark.asyncio
 async def test_create_agent_identity_strict_rejects_invalid_hint(isolated_env, monkeypatch):
     """In strict mode, create_agent_identity should reject invalid name hints."""
     monkeypatch.setenv("AGENT_NAME_ENFORCEMENT_MODE", "strict")
