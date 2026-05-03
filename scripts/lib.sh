@@ -151,26 +151,40 @@ resolve_integration_bearer_token() {
 
 # Generate a fresh bearer token using whatever entropy source is available.
 # Probes: openssl > python3 > python > uv-run python > /dev/urandom > timestamp.
-# Output: 64 hex chars (or hostname-stamped fallback when nothing else exists).
+# Output: 64 hex chars on every path except the last-resort timestamp fallback,
+# which emits "<unix-ns>_<hostname>" only when no real entropy source exists.
+#
+# Each candidate is captured into a local variable and length-validated before
+# being accepted. This prevents partial stdout from a failed candidate (e.g.
+# python printing diagnostic text to stdout before crashing) from leaking into
+# the result, and rejects short reads from /dev/urandom that occur in pre-seed
+# / restricted environments.
 generate_bearer_token() {
+  local token=""
   if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 32
-    return 0
+    token=$(openssl rand -hex 32 2>/dev/null) || token=""
+    [[ ${#token} -eq 64 ]] || token=""
   fi
-  local -a python_candidates=()
-  command -v python3 >/dev/null 2>&1 && python_candidates+=("python3")
-  command -v python >/dev/null 2>&1 && python_candidates+=("python")
-  local py
-  for py in "${python_candidates[@]}"; do
-    "$py" -c 'import secrets;print(secrets.token_hex(32))' 2>/dev/null && return 0
-  done
-  if command -v uv >/dev/null 2>&1; then
-    uv run --no-project python -c 'import secrets;print(secrets.token_hex(32))' 2>/dev/null && return 0
+  if [[ -z "$token" ]] && command -v python3 >/dev/null 2>&1; then
+    token=$(python3 -c 'import secrets;print(secrets.token_hex(32))' 2>/dev/null) || token=""
+    [[ ${#token} -eq 64 ]] || token=""
   fi
-  if [[ -r /dev/urandom ]]; then
-    head -c 32 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' && printf '\n' && return 0
+  if [[ -z "$token" ]] && command -v python >/dev/null 2>&1; then
+    token=$(python -c 'import secrets;print(secrets.token_hex(32))' 2>/dev/null) || token=""
+    [[ ${#token} -eq 64 ]] || token=""
   fi
-  printf '%s_%s\n' "$(date +%s%N 2>/dev/null || date +%s)" "$(hostname 2>/dev/null || echo host)"
+  if [[ -z "$token" ]] && command -v uv >/dev/null 2>&1; then
+    token=$(uv run --no-project python -c 'import secrets;print(secrets.token_hex(32))' 2>/dev/null) || token=""
+    [[ ${#token} -eq 64 ]] || token=""
+  fi
+  if [[ -z "$token" ]] && [[ -r /dev/urandom ]]; then
+    token=$(head -c 32 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n') || token=""
+    [[ ${#token} -eq 64 ]] || token=""
+  fi
+  if [[ -z "$token" ]]; then
+    token="$(date +%s%N 2>/dev/null || date +%s)_$(hostname 2>/dev/null || echo host)"
+  fi
+  printf '%s\n' "$token"
 }
 
 # Write the standard run-helper script at the given path. The helper resolves

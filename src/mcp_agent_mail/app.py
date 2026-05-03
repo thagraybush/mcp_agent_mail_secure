@@ -7368,13 +7368,20 @@ def build_mcp_server() -> FastMCP:
                 for key in {canonical_name.lower(), sanitized_canonical.lower()}:
                     local_lookup.setdefault(key, canonical_name)
 
-            # PR #138 Bug 1 fix: pre-fetch approved cross-project AgentLinks for
+            # PR #138 Bug 1 fix: pre-fetch approved CROSS-project AgentLinks for
             # this sender. When a bare recipient name has BOTH a local agent and
             # an approved cross-project link (e.g. a stale shadow agent left
             # over from a prior auto_contact_if_blocked + handshake cycle), we
             # prefer the cross-project route — the explicit prior approval is
             # the load-bearing signal of intent, and silently delivering to a
             # local shadow has caused message loss in production.
+            #
+            # Only cross-project links go in this lookup. Same-project links
+            # are handled by the existing local-resolution path (and the
+            # existing AgentLink-based fallback further down) — including them
+            # here would cause messages to land in the `external` bucket keyed
+            # by the sender's own project, which downstream code does not
+            # expect.
             agent_link_lookup: dict[str, tuple[Project, Agent]] = {}
             if sender.id is not None and project.id is not None:
                 link_rows = await sx.execute(
@@ -7384,6 +7391,7 @@ def build_mcp_server() -> FastMCP:
                     .where(
                         cast(Any, AgentLink.a_project_id) == project.id,
                         cast(Any, AgentLink.a_agent_id) == sender.id,
+                        cast(Any, AgentLink.b_project_id) != project.id,
                         _active_approved_agent_link_clause(),
                     )
                 )
