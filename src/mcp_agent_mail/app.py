@@ -7117,8 +7117,45 @@ def build_mcp_server() -> FastMCP:
                     logger.exception("Failed to batch fetch approved agent links")
                     approved_link_ids = set()
 
+                # PR #138 Bug 1: also gather names for which this sender has any
+                # approved cross-project AgentLink. When a bare name routes to
+                # another project (handled later in _route), the local-side
+                # contact-policy enforcement must not loud-fail on a same-named
+                # local shadow — the cross-project link is the explicit approval.
+                cross_project_approved_names: set[str] = set()
+                try:
+                    xp_link_rows = await s3.execute(
+                        select(Agent.name)
+                        .join(AgentLink, cast(Any, AgentLink.b_agent_id) == Agent.id)
+                        .where(
+                            cast(Any, AgentLink.a_project_id) == project.id,
+                            cast(Any, AgentLink.a_agent_id) == sender.id,
+                            cast(Any, AgentLink.b_project_id) != project.id,
+                            _active_approved_agent_link_clause(now_utc),
+                        )
+                    )
+                    for (xp_name,) in xp_link_rows.all():
+                        nm_str = (xp_name or "").strip()
+                        if not nm_str:
+                            continue
+                        cross_project_approved_names.add(nm_str.lower())
+                        sanitized_xp = sanitize_agent_name(nm_str) or nm_str
+                        cross_project_approved_names.add(sanitized_xp.lower())
+                except Exception:
+                    logger.exception("Failed to batch fetch cross-project agent links for policy bypass")
+                    cross_project_approved_names = set()
+
                 for nm in to + (cc or []) + (bcc or []):
                     if nm in auto_ok_names:
+                        continue
+                    # PR #138 Bug 1: name resolves cross-project via approved link;
+                    # the local contact policy is irrelevant since delivery routes
+                    # to the other project's recipient (handled in _route below).
+                    nm_keys = {(nm or "").strip().lower()}
+                    sanitized_nm = sanitize_agent_name(nm or "") or ""
+                    if sanitized_nm:
+                        nm_keys.add(sanitized_nm.lower())
+                    if nm_keys & cross_project_approved_names:
                         continue
                     # recipient lookup (from batch-fetched dict)
                     rec = recipient_agents.get(nm)
@@ -7331,6 +7368,33 @@ def build_mcp_server() -> FastMCP:
                 for key in {canonical_name.lower(), sanitized_canonical.lower()}:
                     local_lookup.setdefault(key, canonical_name)
 
+            # PR #138 Bug 1 fix: pre-fetch approved cross-project AgentLinks for
+            # this sender. When a bare recipient name has BOTH a local agent and
+            # an approved cross-project link (e.g. a stale shadow agent left
+            # over from a prior auto_contact_if_blocked + handshake cycle), we
+            # prefer the cross-project route — the explicit prior approval is
+            # the load-bearing signal of intent, and silently delivering to a
+            # local shadow has caused message loss in production.
+            agent_link_lookup: dict[str, tuple[Project, Agent]] = {}
+            if sender.id is not None and project.id is not None:
+                link_rows = await sx.execute(
+                    select(AgentLink, Project, Agent)
+                    .join(Project, Project.id == AgentLink.b_project_id)
+                    .join(Agent, cast(Any, Agent.id == AgentLink.b_agent_id))
+                    .where(
+                        cast(Any, AgentLink.a_project_id) == project.id,
+                        cast(Any, AgentLink.a_agent_id) == sender.id,
+                        _active_approved_agent_link_clause(),
+                    )
+                )
+                for _link, b_project, b_agent in link_rows.all():
+                    canonical = (b_agent.name or "").strip()
+                    if not canonical:
+                        continue
+                    sanitized_b = sanitize_agent_name(canonical) or canonical
+                    for key in {canonical.lower(), sanitized_b.lower()}:
+                        agent_link_lookup.setdefault(key, (b_project, b_agent))
+
             sender_candidate_keys = {
                 key.lower()
                 for key in (
@@ -7423,13 +7487,35 @@ def build_mcp_server() -> FastMCP:
                             resolved_local = local_lookup.get(key)
                             if resolved_local:
                                 break
-                        if resolved_local:
+                        cross_link_match: tuple[Project, Agent] | None = None
+                        for key in key_candidates:
+                            cross_link_match = agent_link_lookup.get(key)
+                            if cross_link_match:
+                                break
+                        if resolved_local and cross_link_match is None:
+                            # Local-only match: route locally as before.
                             if kind == "to":
                                 local_to.append(resolved_local)
                             elif kind == "cc":
                                 local_cc.append(resolved_local)
                             else:
                                 local_bcc.append(resolved_local)
+                            continue
+                        if resolved_local and cross_link_match is not None:
+                            # PR #138 Bug 1: name has BOTH a local agent and an
+                            # approved cross-project link. Prefer cross-project —
+                            # the link is explicit prior intent; the local could
+                            # be a stale shadow from a prior auto_contact cycle.
+                            target_project_xp, target_agent_xp = cross_link_match
+                            pol = (getattr(target_agent_xp, "contact_policy", "auto") or "auto").lower()
+                            if pol == "block_all":
+                                await ctx.error("CONTACT_BLOCKED: Recipient is not accepting messages.")
+                                raise _ContactBlocked()
+                            bucket = external.setdefault(
+                                target_project_xp.id or 0,
+                                {"project": target_project_xp, "to": [], "cc": [], "bcc": []},
+                            )
+                            bucket[kind].append(target_agent_xp.name)
                             continue
 
                     lookup_value = canonical.lower()
