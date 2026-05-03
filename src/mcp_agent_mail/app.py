@@ -7530,20 +7530,15 @@ def build_mcp_server() -> FastMCP:
                             cross_link_match = agent_link_lookup.get(key)
                             if cross_link_match:
                                 break
-                        if resolved_local and cross_link_match is None:
-                            # Local-only match: route locally as before.
-                            if kind == "to":
-                                local_to.append(resolved_local)
-                            elif kind == "cc":
-                                local_cc.append(resolved_local)
-                            else:
-                                local_bcc.append(resolved_local)
-                            continue
-                        if resolved_local and cross_link_match is not None:
-                            # PR #138 Bug 1: name has BOTH a local agent and an
-                            # approved cross-project link. Prefer cross-project —
-                            # the link is explicit prior intent; the local could
-                            # be a stale shadow from a prior auto_contact cycle.
+                        if cross_link_match is not None:
+                            # PR #138 Bug 1: an approved cross-project AgentLink
+                            # is the load-bearing signal of intent. Prefer it
+                            # over both a (possibly stale-shadow) local agent
+                            # and the DB-side AgentLink fallback below — that
+                            # fallback only matches `func.lower(Agent.name) ==
+                            # canonical.lower()` and would miss legacy / non-
+                            # sanitized agent names that the pre-fetch finds
+                            # via the alternate sanitized-form key.
                             target_project_xp, target_agent_xp = cross_link_match
                             pol = (getattr(target_agent_xp, "contact_policy", "auto") or "auto").lower()
                             if pol == "block_all":
@@ -7554,6 +7549,15 @@ def build_mcp_server() -> FastMCP:
                                 {"project": target_project_xp, "to": [], "cc": [], "bcc": []},
                             )
                             bucket[kind].append(target_agent_xp.name)
+                            continue
+                        if resolved_local:
+                            # Local-only (no cross-project link): route locally as before.
+                            if kind == "to":
+                                local_to.append(resolved_local)
+                            elif kind == "cc":
+                                local_cc.append(resolved_local)
+                            else:
+                                local_bcc.append(resolved_local)
                             continue
 
                     lookup_value = canonical.lower()
