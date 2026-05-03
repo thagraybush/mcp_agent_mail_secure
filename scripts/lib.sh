@@ -69,6 +69,152 @@ require_cmd() {
   command -v "$cmd" >/dev/null 2>&1 || { log_err "Missing dependency: $cmd"; exit 1; }
 }
 
+# Read a single KEY=value line from a dotenv-shaped file. Last occurrence wins.
+# Returns the unquoted value on stdout, exit 0 if found, exit 1 otherwise.
+_env_file_value() {
+  local file="$1"
+  local key="$2"
+  [[ -f "$file" ]] || return 1
+  local raw
+  raw=$(grep -E "^[[:space:]]*${key}=" "$file" 2>/dev/null | tail -n 1) || return 1
+  [[ -z "$raw" ]] && return 1
+  raw="${raw#${raw%%[![:space:]]*}}"
+  raw="${raw#${key}=}"
+  raw="${raw#\"}"; raw="${raw%\"}"
+  raw="${raw#\'}"; raw="${raw%\'}"
+  printf '%s\n' "$raw"
+}
+
+# Resolve the active integration bearer token via a layered cascade.
+# Order (first non-empty wins):
+#   1. INTEGRATION_BEARER_TOKEN  (orchestrator-supplied session override)
+#   2. HTTP_BEARER_TOKEN          (already-running server env)
+#   3. MCP_AGENT_MAIL_TOKEN       (project-specific override)
+#   4. /run/credentials/mcp-agent-mail.service/agent-mail-token  (systemd LoadCredential)
+#   5. <root_dir>/.env            (project-local dotenv with HTTP_BEARER_TOKEN=)
+#   6. ${MCP_AGENT_MAIL_ENV_FILE} (operator-pinned env file)
+#   7. ${HOME}/.config/mcp-agent-mail/config.env  (user-default)
+#   8. legacy: scripts/run_server_with_token.sh  (older installs)
+# Always exits 0; emits empty line when nothing matched so callers can branch
+# on the result without distinguishing exit codes.
+resolve_integration_bearer_token() {
+  local root_dir="${1:-$PWD}"
+  root_dir="${root_dir%/}"
+  local cred_file="/run/credentials/mcp-agent-mail.service/agent-mail-token"
+  local token
+
+  for token in \
+    "${INTEGRATION_BEARER_TOKEN:-}" \
+    "${HTTP_BEARER_TOKEN:-}" \
+    "${MCP_AGENT_MAIL_TOKEN:-}"; do
+    if [[ -n "$token" ]]; then
+      printf '%s\n' "$token"
+      return 0
+    fi
+  done
+
+  if [[ -r "$cred_file" ]]; then
+    token=$(tr -d '\r\n' < "$cred_file" 2>/dev/null) || token=""
+    if [[ -n "$token" ]]; then
+      printf '%s\n' "$token"
+      return 0
+    fi
+  fi
+
+  local f
+  for f in \
+    "${root_dir}/.env" \
+    "${MCP_AGENT_MAIL_ENV_FILE:-}" \
+    "${HOME}/.config/mcp-agent-mail/config.env"; do
+    [[ -z "$f" ]] && continue
+    [[ -f "$f" ]] || continue
+    if token=$(_env_file_value "$f" "HTTP_BEARER_TOKEN") && [[ -n "$token" ]]; then
+      printf '%s\n' "$token"
+      return 0
+    fi
+  done
+
+  local legacy="${root_dir}/scripts/run_server_with_token.sh"
+  if [[ -f "$legacy" ]]; then
+    token=$(grep -E '^[[:space:]]*export[[:space:]]+HTTP_BEARER_TOKEN="' "$legacy" 2>/dev/null \
+      | tail -n 1 \
+      | sed -E 's/.*HTTP_BEARER_TOKEN="([^"]+)".*/\1/') || token=""
+    if [[ -n "$token" ]]; then
+      printf '%s\n' "$token"
+      return 0
+    fi
+  fi
+
+  printf '\n'
+  return 0
+}
+
+# Generate a fresh bearer token using whatever entropy source is available.
+# Probes: openssl > python3 > python > uv-run python > /dev/urandom > timestamp.
+# Output: 64 hex chars (or hostname-stamped fallback when nothing else exists).
+generate_bearer_token() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+    return 0
+  fi
+  local -a python_candidates=()
+  command -v python3 >/dev/null 2>&1 && python_candidates+=("python3")
+  command -v python >/dev/null 2>&1 && python_candidates+=("python")
+  local py
+  for py in "${python_candidates[@]}"; do
+    "$py" -c 'import secrets;print(secrets.token_hex(32))' 2>/dev/null && return 0
+  done
+  if command -v uv >/dev/null 2>&1; then
+    uv run --no-project python -c 'import secrets;print(secrets.token_hex(32))' 2>/dev/null && return 0
+  fi
+  if [[ -r /dev/urandom ]]; then
+    head -c 32 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' && printf '\n' && return 0
+  fi
+  printf '%s_%s\n' "$(date +%s%N 2>/dev/null || date +%s)" "$(hostname 2>/dev/null || echo host)"
+}
+
+# Write the standard run-helper script at the given path. The helper resolves
+# HTTP_BEARER_TOKEN via the lib.sh cascade at runtime (preferred) or falls back
+# to its own minimal env-file resolution when lib.sh is missing.
+write_run_helper_script() {
+  local target="$1"
+  write_atomic "$target" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "${ROOT_DIR}/scripts/lib.sh" ]]; then
+  # shellcheck disable=SC1090
+  . "${ROOT_DIR}/scripts/lib.sh"
+fi
+
+if [[ -z "${HTTP_BEARER_TOKEN:-}" ]] && declare -F resolve_integration_bearer_token >/dev/null 2>&1; then
+  HTTP_BEARER_TOKEN="$(resolve_integration_bearer_token "${ROOT_DIR}")"
+fi
+if [[ -z "${HTTP_BEARER_TOKEN:-}" ]]; then
+  if [[ -f "${ROOT_DIR}/.env" ]]; then
+    HTTP_BEARER_TOKEN=$(grep -E '^HTTP_BEARER_TOKEN=' "${ROOT_DIR}/.env" 2>/dev/null | tail -n 1 | sed -E 's/^HTTP_BEARER_TOKEN=//') || true
+  fi
+fi
+if [[ -z "${HTTP_BEARER_TOKEN:-}" ]] && declare -F generate_bearer_token >/dev/null 2>&1; then
+  HTTP_BEARER_TOKEN="$(generate_bearer_token)"
+fi
+if [[ -z "${HTTP_BEARER_TOKEN:-}" ]]; then
+  if command -v openssl >/dev/null 2>&1; then
+    HTTP_BEARER_TOKEN="$(openssl rand -hex 32)"
+  elif command -v uv >/dev/null 2>&1; then
+    HTTP_BEARER_TOKEN="$(uv run python -c 'import secrets;print(secrets.token_hex(32))')"
+  else
+    HTTP_BEARER_TOKEN="$(date +%s)_$(hostname 2>/dev/null || echo host)"
+  fi
+fi
+export HTTP_BEARER_TOKEN
+
+uv run python -m mcp_agent_mail.cli serve-http "$@"
+SH
+  set_secure_exec "$target" || true
+}
+
 # Atomic write: read content from stdin and atomically move to target
 write_atomic() {
   local target="$1"; shift || true
