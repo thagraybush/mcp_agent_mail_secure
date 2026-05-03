@@ -83,7 +83,6 @@ set_secure_file "$OUT_JSON" || true
 
 # Create run helper script
 log_step "Creating run helper script"
-log_step "Creating run helper script"
 mkdir -p scripts
 RUN_HELPER="scripts/run_server_with_token.sh"
 write_run_helper_script "$RUN_HELPER"

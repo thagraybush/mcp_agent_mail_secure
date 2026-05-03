@@ -70,6 +70,8 @@ require_cmd() {
 }
 
 # Read a single KEY=value line from a dotenv-shaped file. Last occurrence wins.
+# Strips leading whitespace, the literal `KEY=` prefix, one pair of surrounding
+# quotes (single or double), and any trailing CR (so CRLF dotenv files work).
 # Returns the unquoted value on stdout, exit 0 if found, exit 1 otherwise.
 _env_file_value() {
   local file="$1"
@@ -78,10 +80,22 @@ _env_file_value() {
   local raw
   raw=$(grep -E "^[[:space:]]*${key}=" "$file" 2>/dev/null | tail -n 1) || return 1
   [[ -z "$raw" ]] && return 1
+  # Strip leading whitespace (tabs/spaces).
   raw="${raw#${raw%%[![:space:]]*}}"
+  # Strip the `KEY=` prefix.
   raw="${raw#${key}=}"
-  raw="${raw#\"}"; raw="${raw%\"}"
-  raw="${raw#\'}"; raw="${raw%\'}"
+  # Strip a trailing CR (CRLF source files) BEFORE quote stripping, otherwise
+  # the closing quote is no longer at the end of the string and we would leak
+  # the inner `"`.
+  raw="${raw%$'\r'}"
+  # Strip one matching pair of surrounding quotes (double or single). We
+  # require the open and close to be the same kind so we do not accidentally
+  # eat a single trailing quote out of a value like KEY=foo"bar.
+  if [[ ${#raw} -ge 2 && "${raw:0:1}" == '"' && "${raw: -1}" == '"' ]]; then
+    raw="${raw:1:${#raw}-2}"
+  elif [[ ${#raw} -ge 2 && "${raw:0:1}" == "'" && "${raw: -1}" == "'" ]]; then
+    raw="${raw:1:${#raw}-2}"
+  fi
   printf '%s\n' "$raw"
 }
 
