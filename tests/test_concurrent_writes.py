@@ -571,6 +571,37 @@ async def test_concurrent_message_bundle_writes(isolated_env):
     assert len(errors) < 5, f"Most writes should succeed: {errors}"
 
 
+@pytest.mark.asyncio
+async def test_message_bundle_commit_message_is_terse(isolated_env):
+    """Default commit messages must be terse, not Rich-rendered ASCII art (regression: #156)."""
+    settings = _config.get_settings()
+
+    from mcp_agent_mail.storage import ensure_archive, write_message_bundle
+
+    archive = await ensure_archive(settings, "commit-shape-test")
+
+    await write_message_bundle(
+        archive,
+        message={"id": 1, "subject": "Hello world", "thread_id": "t1"},
+        body_md="A message body.",
+        sender="Alice",
+        recipients=["Bob", "Carol"],
+    )
+
+    latest = next(iter(archive.repo.iter_commits()))
+    summary = latest.summary
+    body = str(latest.message)
+
+    assert summary == "mail: Alice -> Bob, Carol | Hello world", (
+        f"unexpected commit summary: {summary!r}"
+    )
+    # ASCII-art borders or panel chrome must never appear in commit messages.
+    for forbidden in ("╔", "║", "╚", "MCP TOOL CALL", "Lightning Fast"):
+        assert forbidden not in body, (
+            f"commit body leaked panel chrome ({forbidden!r}):\n{body}"
+        )
+
+
 # =============================================================================
 # Commit Lock Scoping Tests
 # =============================================================================

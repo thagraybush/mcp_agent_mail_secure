@@ -1641,36 +1641,6 @@ def _rich_error_panel(title: str, payload: dict[str, Any]) -> None:
         return
 
 
-def _render_commit_panel(
-    tool_name: str,
-    project_label: str,
-    agent_name: str,
-    start_monotonic: float,
-    end_monotonic: float,
-    result_payload: dict[str, Any],
-    created_iso: Optional[str],
-) -> str | None:
-    """Create the Rich panel text used for Git commit messages."""
-    try:
-        panel_ctx = rich_logger.ToolCallContext(
-            tool_name=tool_name,
-            args=[],
-            kwargs={},
-            project=project_label,
-            agent=agent_name,
-        )
-        panel_ctx.start_time = start_monotonic
-        panel_ctx.end_time = end_monotonic
-        panel_ctx.success = True
-        panel_ctx.result = result_payload
-        if created_iso:
-            parsed = _parse_iso(created_iso)
-            if parsed:
-                panel_ctx._created_at = parsed
-        return rich_logger.render_tool_call_panel(panel_ctx)
-    except Exception:
-        return None
-
 def _project_to_dict(project: Project) -> dict[str, Any]:
     d: dict[str, Any] = {
         "id": project.id,
@@ -5328,25 +5298,6 @@ def build_mcp_server() -> FastMCP:
             if window_identity is not None:
                 payload["window_id"] = window_identity.window_uuid
                 payload["window_display_name"] = window_identity.display_name
-            result_snapshot: dict[str, Any] = {
-                "deliveries": [
-                    {
-                        "project": project.human_key,
-                        "payload": payload,
-                    }
-                ],
-                "count": 1,
-            }
-            panel_end = time.perf_counter()
-            commit_panel_text = _render_commit_panel(
-                tool_name,
-                project.human_key,
-                sender.name,
-                call_start,
-                panel_end,
-                result_snapshot,
-                frontmatter.get("created"),
-            )
             await write_message_bundle(
                 archive,
                 frontmatter,
@@ -5354,7 +5305,6 @@ def build_mcp_server() -> FastMCP:
                 sender_archive_label,
                 recipients_for_archive,
                 attachment_files,
-                commit_panel_text,
                 sender_outbox_name=sender.name if sender_is_local else None,
             )
 
