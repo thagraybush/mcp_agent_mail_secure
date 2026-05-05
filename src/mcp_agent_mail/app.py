@@ -4213,6 +4213,7 @@ async def _list_inbox(
     include_bodies: bool,
     since_ts: Optional[str],
     topic: Optional[str] = None,
+    unread_only: bool = False,
 ) -> list[dict[str, Any]]:
     if project.id is None or agent.id is None:
         raise ValueError("Project and agent must have ids before listing inbox.")
@@ -4247,6 +4248,14 @@ async def _list_inbox(
                 stmt = stmt.where(Message.created_ts > _naive_utc(since_dt))
         if topic:
             stmt = stmt.where(cast(Any, func.lower(Message.topic)) == topic.lower())
+        if unread_only:
+            # Per-recipient read state: the existing JOIN already scopes
+            # MessageRecipient to this agent, so a NULL read_ts is exactly
+            # "this recipient has not been marked read." A bare fetch_inbox
+            # call does NOT mark messages read; only mark_message_read /
+            # acknowledge_message do. The supporting index
+            # idx_message_recipients_agent_message keeps the JOIN cheap.
+            stmt = stmt.where(cast(Any, MessageRecipient.read_ts).is_(None))
         result = await session.execute(stmt)
         rows = result.all()
     messages: list[dict[str, Any]] = []
@@ -9020,6 +9029,7 @@ def build_mcp_server() -> FastMCP:
         include_bodies: bool = False,
         since_ts: Optional[str] = None,
         topic: Optional[str] = None,
+        unread_only: bool = False,
         registration_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> list[dict[str, Any]]:
@@ -9033,11 +9043,20 @@ def build_mcp_server() -> FastMCP:
         - `limit`: max number of messages (default 20)
         - `include_bodies`: include full Markdown bodies in the payloads
         - `topic`: filter to messages with this topic tag
+        - `unread_only`: when True, restrict to messages this recipient has not
+          yet explicitly marked read via `mark_message_read` or
+          `acknowledge_message`. Per-recipient: a message read by Agent A is
+          still unread for Agent B. A bare `fetch_inbox` call does NOT mark
+          messages read; this filter inspects existing read state without
+          mutating it.
 
         Usage patterns
         --------------
         - Poll after each editing step in an agent loop to pick up coordination messages.
         - Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.
+        - Use `unread_only=True` from polling agents (Claude Code, Codex, etc.) to skip
+          messages the agent has already acknowledged — cuts token-burn at scale by
+          avoiding re-running prompt context against already-handled mail.
         - Combine with `acknowledge_message` if `ack_required` is true.
 
         Returns
@@ -9089,11 +9108,23 @@ def build_mcp_server() -> FastMCP:
                 token_param="registration_token",
                 action="fetch_inbox",
             )
-            items = await _list_inbox(project, agent, limit, urgent_only, include_bodies, since_ts, topic=topic)
+            items = await _list_inbox(
+                project,
+                agent,
+                limit,
+                urgent_only,
+                include_bodies,
+                since_ts,
+                topic=topic,
+                unread_only=unread_only,
+            )
             if settings.notifications.enabled:
                 with suppress(Exception):
                     await clear_notification_signal(settings, project.slug, agent.name)
-            await ctx.info(f"Fetched {len(items)} messages for '{agent.name}'. urgent_only={urgent_only}")
+            await ctx.info(
+                f"Fetched {len(items)} messages for '{agent.name}'. "
+                f"urgent_only={urgent_only} unread_only={unread_only}"
+            )
             return items
         except Exception as exc:
             _rich_error_panel("fetch_inbox", {"error": str(exc)})
@@ -9114,6 +9145,7 @@ def build_mcp_server() -> FastMCP:
         include_bodies: bool = True,
         since_ts: Optional[str] = None,
         agent_name: Optional[str] = None,
+        unread_only: bool = False,
         registration_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> list[dict[str, Any]]:
@@ -9132,6 +9164,15 @@ def build_mcp_server() -> FastMCP:
             Include full Markdown bodies in the payloads (default true).
         since_ts : Optional[str]
             ISO-8601 timestamp; only messages newer than this are returned.
+        unread_only : bool
+            When True, restrict to messages where the viewer has a recipient
+            row that has not been explicitly marked read. This narrows beyond
+            the default sender-or-recipient visibility — messages the viewer
+            sent (but is not a recipient of) and broadcast/thread-visible
+            messages where the viewer has no MessageRecipient row are
+            excluded under this flag, because "unread" is only well-defined
+            for a recipient row. A bare `fetch_topic` call does NOT mark
+            messages read.
 
         Returns
         -------
@@ -9185,6 +9226,23 @@ def build_mcp_server() -> FastMCP:
                 since_dt = _parse_iso(since_ts)
                 if since_dt:
                     stmt = stmt.where(Message.created_ts > _naive_utc(since_dt))
+            if unread_only:
+                # Narrow to recipient rows the viewer has not marked read.
+                # Aliasing matters here: `_message_visible_to_agent_clause`
+                # already references MessageRecipient inside an EXISTS, and
+                # an unaliased outer JOIN would auto-correlate against that
+                # subquery and produce wrong results.
+                viewer_recipient = aliased(MessageRecipient)
+                stmt = (
+                    stmt.join(
+                        viewer_recipient,
+                        cast(Any, viewer_recipient.message_id) == Message.id,
+                    )
+                    .where(
+                        cast(Any, viewer_recipient.agent_id) == (viewer.id or 0),
+                        cast(Any, viewer_recipient.read_ts).is_(None),
+                    )
+                )
             result = await session.execute(stmt)
             rows = result.all()
         messages: list[dict[str, Any]] = []
@@ -9199,7 +9257,10 @@ def build_mcp_server() -> FastMCP:
                 sender_project_slug=sender_project_slug,
             )
             messages.append(payload)
-        await ctx.info(f"Fetched {len(messages)} messages with topic '{topic_name}'.")
+        await ctx.info(
+            f"Fetched {len(messages)} messages with topic '{topic_name}'. "
+            f"unread_only={unread_only}"
+        )
         return messages
 
     @mcp.tool(name="mark_message_read")
@@ -12105,11 +12166,16 @@ def build_mcp_server() -> FastMCP:
             urgent_only: bool = False,
             include_bodies: bool = False,
             since_ts: Optional[str] = None,
+            unread_only: bool = False,
             registration_token: Optional[str] = None,
             format: Optional[str] = None,
         ) -> list[dict[str, Any]]:
             """
             Retrieve recent messages for an agent across all projects linked to a product (non-mutating).
+
+            `unread_only=True` filters each per-project fetch to recipient rows the agent
+            has not explicitly marked read; especially load-bearing for product-wide
+            polling where the cross-project token cost compounds.
             """
             _product, _projects, authorized = await _authenticate_product_agents(
                 ctx,
@@ -12121,7 +12187,15 @@ def build_mcp_server() -> FastMCP:
             )
             messages: list[dict[str, Any]] = []
             for project, ag in authorized:
-                proj_items = await _list_inbox(project, ag, limit, urgent_only, include_bodies, since_ts)
+                proj_items = await _list_inbox(
+                    project,
+                    ag,
+                    limit,
+                    urgent_only,
+                    include_bodies,
+                    since_ts,
+                    unread_only=unread_only,
+                )
                 for item in proj_items:
                     item["project_id"] = item.get("project_id") or project.id
                     messages.append(item)
@@ -12140,6 +12214,7 @@ def build_mcp_server() -> FastMCP:
             urgent_only: bool = False,
             include_bodies: bool = False,
             since_ts: Optional[str] = None,
+            unread_only: bool = False,
             registration_token: Optional[str] = None,
             format: Optional[str] = None,
         ) -> list[dict[str, Any]]:
