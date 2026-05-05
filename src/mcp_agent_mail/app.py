@@ -13587,22 +13587,21 @@ def build_mcp_server() -> FastMCP:
             token_param="agent_token",
             action="resource://views/urgent-unread/{agent}",
         )
-        items = await _list_inbox(project_obj, agent_obj, limit, urgent_only=True, include_bodies=False, since_ts=None)
-        # Filter unread (no read_ts recorded)
-        unread: list[dict[str, Any]] = []
-        async with get_session() as session:
-            from .models import MessageRecipient  # local import to avoid cycle at top
-
-            for item in items:
-                result = await session.execute(
-                    select(MessageRecipient.read_ts).where(
-                        cast(Any, MessageRecipient.message_id == item["id"]), cast(Any, MessageRecipient.agent_id == agent_obj.id)
-                    )
-                )
-                read_ts = result.scalar_one_or_none()
-                if read_ts is None:
-                    unread.append(item)
-        payload = {"project": project_obj.human_key, "agent": agent_obj.name, "count": len(unread), "messages": unread[:limit]}
+        # Single SQL query: urgent + unread filter at the DB layer. Fixes a
+        # prior N+1 (one read-state probe per row) and a limit-before-filter
+        # correctness bug where the page of `limit` urgent messages would be
+        # narrowed to unread *after* the LIMIT — so users frequently saw
+        # fewer than `limit` unread items even when more existed.
+        unread = await _list_inbox(
+            project_obj,
+            agent_obj,
+            limit,
+            urgent_only=True,
+            include_bodies=False,
+            since_ts=None,
+            unread_only=True,
+        )
+        payload = {"project": project_obj.human_key, "agent": agent_obj.name, "count": len(unread), "messages": unread}
         return _apply_resource_output_format(
             payload,
             settings=settings,
