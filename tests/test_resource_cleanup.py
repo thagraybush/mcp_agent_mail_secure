@@ -259,3 +259,124 @@ async def test_file_reservation_release_works(isolated_env, tmp_path: Path):
             {"project_key": str(workspace), "agent_name": "BlueDog"},
         )
         assert res2.data.get("released", 0) > 0
+
+
+async def _make_workspace_with_git(tmp_path: Path, name: str) -> Path:
+    """Initialize a git repo at tmp_path/<name> with a dummy identity."""
+    workspace = tmp_path / name
+    workspace.mkdir()
+    proc = await asyncio.create_subprocess_exec("git", "init", cwd=str(workspace))
+    await proc.wait()
+    proc = await asyncio.create_subprocess_exec(
+        "git", "config", "user.email", "test@example.com", cwd=str(workspace)
+    )
+    await proc.wait()
+    proc = await asyncio.create_subprocess_exec(
+        "git", "config", "user.name", "Test User", cwd=str(workspace)
+    )
+    await proc.wait()
+    return workspace
+
+
+async def _register_agent(client: Client, workspace: Path, name: str) -> str:
+    """Register an agent and return whatever name the server actually issued
+    (may be a suffixed variant when the requested name collides)."""
+    reg = await client.call_tool(
+        "register_agent",
+        {
+            "project_key": str(workspace),
+            "program": "test-cli",
+            "model": "test-model",
+            "name": name,
+        },
+    )
+    return (reg.data or {}).get("name") or name
+
+
+# file_reservation_paths must surface a `warnings` field flagging code-repo
+# paths as advisory-only — wrappers (e.g. ntm's `lock` subcommand) rely on
+# this signal to warn the operator that server-side exclusivity does not
+# fully cover code paths and the pre-commit guard is the authoritative gate.
+# Archive paths (agents/, messages/, attachments/, threads/, file_reservations/)
+# are enforced server-side and must NOT produce a warning. (#162)
+@pytest.mark.asyncio
+async def test_file_reservation_warns_on_code_repo_paths(isolated_env, tmp_path: Path):
+    server = build_mcp_server()
+    workspace = await _make_workspace_with_git(tmp_path, "code_paths")
+
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": str(workspace)})
+        agent_name = await _register_agent(client, workspace, "WarnCode")
+
+        result = await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": str(workspace),
+                "agent_name": agent_name,
+                "paths": ["src/main.py", "lib/**/*.rs"],
+                "ttl_seconds": 3600,
+            },
+        )
+        warnings_list = result.data.get("warnings") or []
+        assert any(
+            isinstance(w, str) and w.startswith("enforcement_off_for_code_paths")
+            for w in warnings_list
+        ), f"expected enforcement_off_for_code_paths warning, got: {warnings_list!r}"
+        # Count metadata: "2 of 2 reserved paths are code-repo paths"
+        joined = " ".join(warnings_list)
+        assert "2 of 2" in joined
+
+
+@pytest.mark.asyncio
+async def test_file_reservation_silent_on_archive_only_paths(
+    isolated_env, tmp_path: Path
+):
+    server = build_mcp_server()
+    workspace = await _make_workspace_with_git(tmp_path, "archive_paths")
+
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": str(workspace)})
+        agent_name = await _register_agent(client, workspace, "WarnArchive")
+
+        result = await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": str(workspace),
+                "agent_name": agent_name,
+                "paths": ["agents/Foo/**", "messages/2026/*"],
+                "ttl_seconds": 3600,
+            },
+        )
+        warnings_list = result.data.get("warnings") or []
+        assert warnings_list == [], (
+            f"archive-only reservation must not produce warnings: {warnings_list!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_file_reservation_warns_on_mixed_paths(isolated_env, tmp_path: Path):
+    """A single code-repo path among an otherwise-archive set must still trigger
+    the warning, with metadata reflecting only the advisory subset."""
+    server = build_mcp_server()
+    workspace = await _make_workspace_with_git(tmp_path, "mixed_paths")
+
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": str(workspace)})
+        agent_name = await _register_agent(client, workspace, "WarnMixed")
+
+        result = await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": str(workspace),
+                "agent_name": agent_name,
+                "paths": ["agents/Foo/**", "messages/inbox", "src/main.py"],
+                "ttl_seconds": 3600,
+            },
+        )
+        warnings_list = result.data.get("warnings") or []
+        assert any(
+            isinstance(w, str) and w.startswith("enforcement_off_for_code_paths")
+            for w in warnings_list
+        )
+        joined = " ".join(warnings_list)
+        assert "1 of 3" in joined
