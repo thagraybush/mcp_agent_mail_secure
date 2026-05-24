@@ -938,12 +938,19 @@ async def test_file_reservations_resource_surfaces_orphaned(isolated_env):
             await session.execute(delete(Agent).where(Agent.name == agent_name))
             await session.commit()
 
-        blocks = await client.read_resource("resource://file_reservations/orphan")
+        # Orphaned reservations are stale=True by definition, so the resource
+        # endpoint auto-releases them via `_expire_stale_file_reservations`
+        # before serving the listing. That's the desired behavior — orphans
+        # no longer pin the path. To inspect the post-release record we have
+        # to ask for the full (released-inclusive) listing.
+        blocks = await client.read_resource(
+            "resource://file_reservations/orphan?active_only=false"
+        )
         data = parse_resource_json(blocks)
-        reservations = data.get("file_reservations") or data.get("reservations") or []
-        orphans = [r for r in reservations if r.get("path_pattern") == "src/orphan_target.py"]
+        assert isinstance(data, list), f"expected list payload, got {type(data).__name__}"
+        orphans = [r for r in data if r.get("path_pattern") == "src/orphan_target.py"]
         assert len(orphans) == 1, (
-            f"orphaned reservation must still be listed; got {reservations!r}"
+            f"orphaned reservation must still be listed (released, not dropped); got {data!r}"
         )
         orphan = orphans[0]
         # agent name is None (the row is gone), but the original agent_id is
@@ -954,4 +961,7 @@ async def test_file_reservations_resource_surfaces_orphaned(isolated_env):
         )
         assert "agent_unresolved" in (orphan.get("stale_reasons") or []), (
             f"expected agent_unresolved stale reason, got {orphan.get('stale_reasons')!r}"
+        )
+        assert orphan.get("released_ts") is not None, (
+            "orphaned reservation must have been auto-released by the sweep"
         )
