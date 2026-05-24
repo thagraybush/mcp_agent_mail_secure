@@ -3292,16 +3292,22 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 if not prow:
                     return await _render("error.html", message="Project not found")
                 pid = int(prow[0])
+                # LEFT JOIN so orphaned reservations whose owning agent row
+                # has been deleted still surface in the web UI (`a.name` will
+                # be NULL — render as "<orphaned>" so operators see them and
+                # can act). Matches the model-side LEFT JOIN in
+                # _collect_file_reservation_statuses. (#161)
                 rows = await session.execute(
                     text(
-                        "SELECT c.id, a.name, c.path_pattern, c.exclusive, c.created_ts, c.expires_ts, c.released_ts FROM file_reservations c JOIN agents a ON a.id = c.agent_id WHERE c.project_id = :pid ORDER BY c.created_ts DESC"
+                        "SELECT c.id, a.name, c.path_pattern, c.exclusive, c.created_ts, c.expires_ts, c.released_ts, c.agent_id FROM file_reservations c LEFT JOIN agents a ON a.id = c.agent_id WHERE c.project_id = :pid ORDER BY c.created_ts DESC"
                     ),
                     {"pid": pid},
                 )
                 file_reservations = [
                     {
                         "id": r[0],
-                        "agent": r[1],
+                        "agent": r[1] if r[1] is not None else "<orphaned>",
+                        "agent_id": r[7],
                         "path_pattern": r[2],
                         "exclusive": bool(r[3]),
                         "created": str(r[4]),
