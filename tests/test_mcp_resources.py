@@ -26,8 +26,11 @@ from urllib.parse import quote
 
 import pytest
 from fastmcp import Client
+from sqlalchemy import delete
 
 from mcp_agent_mail.app import build_mcp_server
+from mcp_agent_mail.db import get_session
+from mcp_agent_mail.models import Agent
 
 # ============================================================================
 # Helper: Parse JSON from resource blocks
@@ -902,3 +905,53 @@ async def test_agent_scoped_resources_require_project(isolated_env, uri_template
 
         with pytest.raises(Exception, match="project"):
             await client.read_resource(uri_template.format(agent=agent_name))
+
+
+# When an Agent row is deleted out from under an outstanding FileReservation
+# (manual hygiene, project rotation, test reset), the reservation must still
+# be discoverable so the staleness sweeper can release it. Before #161 the
+# INNER JOIN dropped these rows from the listing entirely, leaving the path
+# pinned forever. (#161)
+@pytest.mark.asyncio
+async def test_file_reservations_resource_surfaces_orphaned(isolated_env):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/orphan"})
+        agent_result = await client.call_tool(
+            "register_agent",
+            {"project_key": "orphan", "program": "test", "model": "test"},
+        )
+        agent_name = agent_result.data["name"]
+
+        await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": "orphan",
+                "agent_name": agent_name,
+                "paths": ["src/orphan_target.py"],
+            },
+        )
+
+        # Delete the owning agent row out-of-band — mimics the operational
+        # condition the issue describes.
+        async with get_session() as session:
+            await session.execute(delete(Agent).where(Agent.name == agent_name))
+            await session.commit()
+
+        blocks = await client.read_resource("resource://file_reservations/orphan")
+        data = parse_resource_json(blocks)
+        reservations = data.get("file_reservations") or data.get("reservations") or []
+        orphans = [r for r in reservations if r.get("path_pattern") == "src/orphan_target.py"]
+        assert len(orphans) == 1, (
+            f"orphaned reservation must still be listed; got {reservations!r}"
+        )
+        orphan = orphans[0]
+        # agent name is None (the row is gone), but the original agent_id is
+        # preserved for forensics — same row stays available for sweepers.
+        assert orphan.get("agent") is None, f"orphan agent must be null, got {orphan!r}"
+        assert orphan.get("agent_id") is not None, (
+            "agent_id must still carry the deleted agent's id for forensics"
+        )
+        assert "agent_unresolved" in (orphan.get("stale_reasons") or []), (
+            f"expected agent_unresolved stale reason, got {orphan.get('stale_reasons')!r}"
+        )

@@ -1214,7 +1214,11 @@ def _require_project_resource_param(project: Optional[str], *, resource_name: st
 @dataclass(slots=True)
 class FileReservationStatus:
     reservation: FileReservation
-    agent: Agent
+    # None when the reservation is orphaned (owning agent row deleted, or
+    # agent_id is NULL). Downstream code must treat agent=None as
+    # "perpetually inactive, no mail/activity signal possible" and is
+    # responsible for ASCII-safe rendering of the missing name. (#161)
+    agent: Optional[Agent]
     stale: bool
     stale_reasons: list[str]
     last_agent_activity: Optional[datetime]
@@ -3661,7 +3665,11 @@ async def _create_file_reservation(
 def _file_reservation_payload(
     project: Project,
     reservation: FileReservation,
-    agent: Agent,
+    # Agent is Optional because expire/release records may carry None when the
+    # reservation is orphaned (owning Agent row deleted). The payload emits
+    # agent=null in that case and falls back to `reservation.agent_id` for
+    # forensics. (#161)
+    agent: Optional[Agent],
     *,
     branch: Optional[str] = None,
     worktree: Optional[str] = None,
@@ -3683,7 +3691,11 @@ def _file_reservation_payload(
     payload: dict[str, Any] = {
         "id": reservation.id,
         "project": project.human_key,
-        "agent": agent.name,
+        # `agent` is None when the reservation is orphaned (#161). Emit null in
+        # JSON and keep `agent_id` for forensics so sweepers / dashboards can
+        # still link the row back to the deleted Agent row.
+        "agent": agent.name if agent is not None else None,
+        "agent_id": reservation.agent_id,
         "path_pattern": reservation.path_pattern,
         "exclusive": reservation.exclusive,
         "reason": reason_override if reason_override is not None else reservation.reason,
@@ -3701,7 +3713,9 @@ def _file_reservation_payload(
 
 async def _write_file_reservation_records(
     project: Project,
-    records: Sequence[tuple[FileReservation, Agent]],
+    # Optional[Agent] in each tuple: expired-pair records may carry None when
+    # the reservation outlived its owning Agent row. (#161)
+    records: Sequence[tuple[FileReservation, Optional[Agent]]],
     *,
     archive: ProjectArchive | None = None,
     archive_locked: bool = False,
@@ -3751,7 +3765,11 @@ async def _collect_file_reservation_statuses(
     async with get_session() as session:
         stmt = (
             select(FileReservation, Agent)
-            .join(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
+            # LEFT JOIN so orphaned reservations (agent row deleted or agent_id
+            # is NULL) are still surfaced; the staleness sweeper then has a
+            # chance to auto-release them instead of letting them pin the
+            # path forever. (#161)
+            .outerjoin(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
             .where(FileReservation.project_id == project.id)
             .order_by(asc(FileReservation.created_ts))
         )
@@ -3761,7 +3779,7 @@ async def _collect_file_reservation_statuses(
         rows = result.all()
         if not rows:
             return []
-        agent_ids = [agent.id for _, agent in rows if agent.id is not None]
+        agent_ids = [agent.id for _, agent in rows if agent is not None and agent.id is not None]
         send_map: dict[int, Optional[datetime]] = {}
         ack_map: dict[int, Optional[datetime]] = {}
         read_map: dict[int, Optional[datetime]] = {}
@@ -3804,9 +3822,22 @@ async def _collect_file_reservation_statuses(
     statuses: list[FileReservationStatus] = []
     try:
         for reservation, agent in rows:
-            agent_id = agent.id or -1
-            agent_last_active = _ensure_utc(agent.last_active_ts)
-            last_mail = _max_datetime(send_map.get(agent_id), ack_map.get(agent_id), read_map.get(agent_id))
+            # Orphaned reservation: agent row is gone (or never existed).
+            # Treat as perpetually inactive with no mail signal so the sweeper
+            # auto-releases it; tag the reasons so callers can distinguish
+            # `agent_missing` (NULL agent_id, never resolvable) from
+            # `agent_unresolved` (had an id but row was deleted). (#161)
+            agent_orphaned = agent is None
+            if agent_orphaned:
+                agent_id = None
+                agent_last_active = None
+                last_mail = None
+            else:
+                agent_id = agent.id or -1
+                agent_last_active = _ensure_utc(agent.last_active_ts)
+                last_mail = _max_datetime(
+                    send_map.get(agent_id), ack_map.get(agent_id), read_map.get(agent_id)
+                )
 
             matches: list[Path] = []
             fs_activity: Optional[datetime] = None
@@ -3827,15 +3858,24 @@ async def _collect_file_reservation_statuses(
 
             stale = bool(
                 reservation.released_ts is None
-                and agent_inactive
-                and not (recent_mail or recent_fs or recent_git)
+                and (agent_orphaned or (agent_inactive and not (recent_mail or recent_fs or recent_git)))
             )
             reasons: list[str] = []
-            if agent_inactive:
+            if agent_orphaned:
+                # Distinguish never-had-owner from owner-was-deleted; both are
+                # terminal for the reservation but each tells a different
+                # operational story (config bug vs cleanup hygiene).
+                if reservation.agent_id is None:
+                    reasons.append("agent_missing")
+                else:
+                    reasons.append("agent_unresolved")
+            elif agent_inactive:
                 reasons.append(f"agent_inactive>{inactivity_seconds}s")
             else:
                 reasons.append("agent_recently_active")
-            if recent_mail:
+            if agent_orphaned:
+                reasons.append("no_mail_activity_possible")
+            elif recent_mail:
                 reasons.append("mail_activity_recent")
             else:
                 reasons.append(f"no_recent_mail_activity>{activity_grace}s")
@@ -3955,14 +3995,16 @@ async def _expire_stale_file_reservations(
     async with get_immediate_session() as session:
         expired_rows = await session.execute(
             select(FileReservation, Agent)
-            .join(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
+            # LEFT JOIN — orphaned reservations whose owning agent has been
+            # deleted must still expire on schedule, not pin the path. (#161)
+            .outerjoin(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
             .where(
                 cast(Any, FileReservation.project_id) == project_id,
                 cast(Any, FileReservation.released_ts).is_(None),
                 cast(Any, FileReservation.expires_ts) < naive_now,  # SQLite needs naive datetime
             )
         )
-        expired_pairs = [cast(tuple[FileReservation, Agent], row) for row in expired_rows.all()]
+        expired_pairs = [cast(tuple[FileReservation, Optional[Agent]], row) for row in expired_rows.all()]
         if expired_pairs:
             await session.execute(
                 update(FileReservation)
@@ -3996,7 +4038,7 @@ async def _expire_stale_file_reservations(
     for reservation, _agent in expired_pairs:
         reservation.released_ts = naive_now
 
-    released_pairs: list[tuple[FileReservation, Agent]] = []
+    released_pairs: list[tuple[FileReservation, Optional[Agent]]] = []
     seen_ids: set[int] = set()
     for reservation, agent in expired_pairs:
         if reservation.id is None:
@@ -10869,7 +10911,7 @@ def build_mcp_server() -> FastMCP:
         stale_auto_releases = await _expire_stale_file_reservations(project.id)
         if stale_auto_releases:
             summary = ", ".join(
-                f"{status.agent.name}:{status.reservation.path_pattern}"
+                f"{status.agent.name if status.agent is not None else '<orphaned>'}:{status.reservation.path_pattern}"
                 for status in stale_auto_releases[:5]
             )
             extra = f" ({summary})" if summary else ""
@@ -11482,7 +11524,7 @@ def build_mcp_server() -> FastMCP:
         stale_auto_releases = await _expire_stale_file_reservations(project.id)
         if stale_auto_releases:
             summary = ", ".join(
-                f"{status.agent.name}:{status.reservation.path_pattern}"
+                f"{status.agent.name if status.agent is not None else '<orphaned>'}:{status.reservation.path_pattern}"
                 for status in stale_auto_releases[:5]
             )
             extra = f" ({summary})" if summary else ""
@@ -13144,7 +13186,11 @@ def build_mcp_server() -> FastMCP:
             payload.append(
                 {
                     "id": reservation.id,
-                    "agent": status.agent.name,
+                    # `agent` is None when the reservation is orphaned (owning
+                    # agent row deleted or agent_id NULL). Callers should fall
+                    # back to `agent_id` for debugging. (#161)
+                    "agent": status.agent.name if status.agent is not None else None,
+                    "agent_id": reservation.agent_id,
                     "path_pattern": reservation.path_pattern,
                     "exclusive": reservation.exclusive,
                     "reason": reservation.reason,
