@@ -936,13 +936,17 @@ def _looks_like_toon_rust_encoder(exe: str) -> bool:
     Best-effort guardrail to prevent accidentally using non-toon_rust encoders
     (e.g. the Node.js `toon` CLI or coreutils `tr`).
 
-    We rely on toon_rust's help/version banners, which are stable across installs.
-    """
-    exe_basename = exe.split("/")[-1].split("\\")[-1].lower()
-    if exe_basename in {"toon", "toon.exe"}:
-        # Never accept (or invoke) the Node.js `toon` CLI as the encoder backend.
-        return False
+    Identification uses toon_rust's help and version banners, which are stable
+    across installs. Banner identification is *authoritative* — a binary named
+    "toon" that identifies itself as toon_rust through its help/version output
+    is accepted (issue #163: `cargo install tru` ships a binary named `toon`,
+    so a basename-only rejection breaks every local install).
 
+    We still hard-reject by basename for binaries that fail every banner check
+    so the Node.js toon CLI and friends are kept out — those binaries print
+    neither the toon_rust help marker nor a toon_rust version banner, so they
+    cannot accidentally pass identification.
+    """
     try:
         help_result = subprocess.run(
             [exe, "--help"],
