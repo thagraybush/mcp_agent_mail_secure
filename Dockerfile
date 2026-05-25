@@ -38,8 +38,19 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 ARG TOON_RUST_REPO=https://github.com/Dicklesworthstone/toon_rust.git
 ARG TOON_RUST_REF=main
 
-RUN git clone --depth 1 --branch "${TOON_RUST_REF}" "${TOON_RUST_REPO}" /build/toon_rust && \
+# Resolve ${TOON_RUST_REF} as either a branch, tag, OR commit SHA. We
+# can't use `git clone --depth 1 --branch <ref>` because `--branch`
+# refuses bare commit SHAs ("Remote branch <sha> not found in upstream
+# origin"), which would prevent pinning the encoder to a specific
+# upstream commit via `--build-arg TOON_RUST_REF=<sha>`. Instead: init
+# an empty repo, fetch *just* the requested ref with depth 1 (works for
+# branches, tags, and SHAs on any git remote that supports the v2
+# protocol — github.com does), then check it out.
+RUN git init -q /build/toon_rust && \
     cd /build/toon_rust && \
+    git remote add origin "${TOON_RUST_REPO}" && \
+    git fetch --depth 1 origin "${TOON_RUST_REF}" && \
+    git checkout -q FETCH_HEAD && \
     cargo build --release && \
     # The [[bin]] target is currently named "toon" but mcp_agent_mail expects
     # the binary on $PATH as `tru`. Copy under the expected name. Fall back
