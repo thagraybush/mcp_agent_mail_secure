@@ -20,7 +20,7 @@ import pytest
 # Ensure the in-tree package is importable when running from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from mcp_agent_mail import app as app_module  # noqa: E402
+from mcp_agent_mail import app as app_module
 
 
 def _make_fake_binary(tmp_path: Path, name: str, help_text: str, version_text: str = "") -> str:
