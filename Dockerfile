@@ -38,14 +38,17 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 ARG TOON_RUST_REPO=https://github.com/Dicklesworthstone/toon_rust.git
 ARG TOON_RUST_REF=main
 
-# Resolve ${TOON_RUST_REF} as either a branch, tag, OR commit SHA. We
-# can't use `git clone --depth 1 --branch <ref>` because `--branch`
+# Resolve ${TOON_RUST_REF} as a branch name, tag, or full 40-char commit
+# SHA. We can't use `git clone --depth 1 --branch <ref>` because `--branch`
 # refuses bare commit SHAs ("Remote branch <sha> not found in upstream
-# origin"), which would prevent pinning the encoder to a specific
-# upstream commit via `--build-arg TOON_RUST_REF=<sha>`. Instead: init
-# an empty repo, fetch *just* the requested ref with depth 1 (works for
-# branches, tags, and SHAs on any git remote that supports the v2
-# protocol — github.com does), then check it out.
+# origin"), which would prevent pinning the encoder to a specific upstream
+# commit via `--build-arg TOON_RUST_REF=<sha>`. Instead: init an empty
+# repo, fetch *just* the requested ref with depth 1, then check it out.
+#
+# Caveat: GitHub's smart-http upload-pack
+# (uploadpack.allowReachableSHA1InWant) only resolves *full* 40-char SHAs
+# in the want list — abbreviated SHAs error out with "couldn't find remote
+# ref". Pass the full SHA, a branch, or a tag.
 RUN git init -q /build/toon_rust && \
     cd /build/toon_rust && \
     git remote add origin "${TOON_RUST_REPO}" && \
