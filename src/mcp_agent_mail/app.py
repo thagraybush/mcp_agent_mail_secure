@@ -930,6 +930,14 @@ def _truncate_text(value: str, *, limit: int = 2000) -> str:
     return f"{value[:limit]}...(+{len(value) - limit} chars)"
 
 
+# Hard cap on every --help / --version probe used to identify the TOON
+# encoder. 5s is generous for any well-behaved CLI but short enough that a
+# hung or hostile binary can't wedge mcp_agent_mail (the encoder request
+# degrades cleanly to JSON when identification times out). Exposed as a
+# module attribute so tests can override it without forking the function.
+_TOON_IDENT_TIMEOUT_SECONDS = 5.0
+
+
 @functools.lru_cache(maxsize=32)
 def _looks_like_toon_rust_encoder(exe: str) -> bool:
     """
@@ -942,21 +950,32 @@ def _looks_like_toon_rust_encoder(exe: str) -> bool:
     is accepted (issue #163: `cargo install tru` ships a binary named `toon`,
     so a basename-only rejection breaks every local install).
 
-    We still hard-reject by basename for binaries that fail every banner check
-    so the Node.js toon CLI and friends are kept out — those binaries print
-    neither the toon_rust help marker nor a toon_rust version banner, so they
-    cannot accidentally pass identification.
+    Lookalikes (the Node.js `toon` CLI, coreutils `tr`, etc.) are still kept
+    out: those binaries print neither the toon_rust help marker
+    ("reference implementation in rust") nor a toon_rust version banner
+    ("tru " / "toon_rust "), so they cannot pass either signal.
     """
+    # text=True + errors="replace": subprocess decodes child output via the
+    # locale-preferred encoding (UTF-8 on modern Linux, ASCII under LC_ALL=C).
+    # A banner with stray high bytes would otherwise raise UnicodeDecodeError,
+    # which is *not* an OSError and would escape this guardrail entirely —
+    # surfacing as a 500-class error on the TOON encode path instead of a
+    # clean reject. errors="replace" preserves the identification substrings
+    # we look for without crashing on a non-UTF-8 locale.
+    #
+    # timeout: bounded via the module-level _TOON_IDENT_TIMEOUT_SECONDS so a
+    # hung binary can't wedge mcp_agent_mail. TimeoutExpired is *not* an
+    # OSError subclass, so it must be caught explicitly.
     try:
         help_result = subprocess.run(
             [exe, "--help"],
             text=True,
+            errors="replace",
             capture_output=True,
             check=False,
+            timeout=_TOON_IDENT_TIMEOUT_SECONDS,
         )
-    except FileNotFoundError:
-        return False
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return False
 
     help_text = (help_result.stdout or "") + "\n" + (help_result.stderr or "")
@@ -967,12 +986,12 @@ def _looks_like_toon_rust_encoder(exe: str) -> bool:
         ver_result = subprocess.run(
             [exe, "--version"],
             text=True,
+            errors="replace",
             capture_output=True,
             check=False,
+            timeout=_TOON_IDENT_TIMEOUT_SECONDS,
         )
-    except FileNotFoundError:
-        return False
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return False
 
     ver_text = ((ver_result.stdout or "") + (ver_result.stderr or "")).strip().lower()
