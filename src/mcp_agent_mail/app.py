@@ -9209,14 +9209,20 @@ def build_mcp_server() -> FastMCP:
         """
         _validate_iso_timestamp(since_ts, "since_ts")
         project = await _get_project_by_identifier(project_key)
-        viewer = await _resolve_authenticated_agent(
-            ctx,
-            project,
-            agent_name=agent_name,
-            provided_token=registration_token,
-            token_param="registration_token",
-            action="fetch_topic",
-        )
+        # Authentication is only required when unread_only=True (which needs a
+        # viewer's recipient rows). A bare fetch_topic call is project-scoped —
+        # it returns all messages with the given topic regardless of who sent or
+        # received them, so no per-agent visibility filter is applied.
+        viewer: Agent | None = None
+        if unread_only or agent_name:
+            viewer = await _resolve_authenticated_agent(
+                ctx,
+                project,
+                agent_name=agent_name,
+                provided_token=registration_token,
+                token_param="registration_token",
+                action="fetch_topic",
+            )
         if not topic_name or not topic_name.strip():
             raise ToolExecutionError(
                 "INVALID_ARGUMENT",
@@ -9245,7 +9251,6 @@ def build_mcp_server() -> FastMCP:
                 .where(
                     cast(Any, Message.project_id) == project.id,
                     cast(Any, func.lower(Message.topic)) == topic_name.strip().lower(),
-                    _message_visible_to_agent_clause(viewer.id or 0),
                 )
                 .order_by(desc(Message.created_ts))
                 .limit(limit)
@@ -9256,10 +9261,9 @@ def build_mcp_server() -> FastMCP:
                     stmt = stmt.where(Message.created_ts > _naive_utc(since_dt))
             if unread_only:
                 # Narrow to recipient rows the viewer has not marked read.
-                # Aliasing matters here: `_message_visible_to_agent_clause`
-                # already references MessageRecipient inside an EXISTS, and
-                # an unaliased outer JOIN would auto-correlate against that
-                # subquery and produce wrong results.
+                # The JOIN on MessageRecipient already restricts to messages
+                # where the viewer has a recipient row, so no additional
+                # _message_visible_to_agent_clause is needed here.
                 viewer_recipient = aliased(MessageRecipient)
                 stmt = (
                     stmt.join(
@@ -9267,7 +9271,7 @@ def build_mcp_server() -> FastMCP:
                         cast(Any, viewer_recipient.message_id) == Message.id,
                     )
                     .where(
-                        cast(Any, viewer_recipient.agent_id) == (viewer.id or 0),
+                        cast(Any, viewer_recipient.agent_id) == (viewer.id or 0),  # type: ignore[union-attr]
                         cast(Any, viewer_recipient.read_ts).is_(None),
                     )
                 )
