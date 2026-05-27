@@ -364,6 +364,61 @@ async def test_invalid_topic_rejected(isolated_env):
             )
 
 
+@pytest.mark.asyncio
+async def test_topic_allows_dotted_bead_ids(isolated_env):
+    """Dotted beads_rust hierarchical IDs (e.g. ``br-abc.1``) are valid topics (issue #165)."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        names = await _setup_project_with_agents(client, "/test/topic-dotted", 2)
+
+        result = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "/test/topic-dotted",
+                "sender_name": names[0],
+                "to": [names[1]],
+                "subject": "Child bead coordination",
+                "body_md": "Working on the child bead.",
+                "topic": "br-abc.1",
+            },
+        )
+        data = _get_data(result)
+        payload = data["deliveries"][0]["payload"]
+        assert payload.get("topic") == "br-abc.1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_topic",
+    [".", "..", "../foo", ".hidden", "a/b", "spaces not allowed", "-leading-hyphen", "_leading_underscore"],
+)
+async def test_topic_rejects_traversal_and_unsafe_shapes(isolated_env, bad_topic):
+    """Path-traversal / dotfile / leading-non-alphanumeric topics are rejected (issue #165 guard)."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        names = await _setup_project_with_agents(client, "/test/topic-traversal", 2)
+
+        try:
+            result = await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "/test/topic-traversal",
+                    "sender_name": names[0],
+                    "to": [names[1]],
+                    "subject": "Bad topic",
+                    "body_md": "body",
+                    "topic": bad_topic,
+                },
+            )
+            assert getattr(result, "is_error", False) or "INVALID_TOPIC" in str(result), (
+                f"Expected INVALID_TOPIC error for {bad_topic!r}, got: {result}"
+            )
+        except Exception as exc:
+            assert "INVALID_TOPIC" in str(exc) or "topic" in str(exc).lower(), (
+                f"Expected topic validation error for {bad_topic!r}, got: {exc}"
+            )
+
+
 # ============================================================================
 # fetch_topic tool
 # ============================================================================

@@ -415,12 +415,57 @@ def get_lock_telemetry() -> dict[str, int]:
         }
 
 
+# macOS ``fcntl`` command for resolving an open fd to its path. Entries under
+# ``/dev/fd`` on Darwin are ``fdesc`` character devices (NOT symlinks), so
+# ``os.readlink`` raises EINVAL there; ``fcntl(fd, F_GETPATH, buf)`` is the
+# portable lookup. Python's ``fcntl`` module doesn't always expose F_GETPATH
+# symbolically, so fall back to the stable value from ``<sys/fcntl.h>`` (50).
+# MAXPATHLEN on macOS is 1024; lockfile paths inside the mail archive are far
+# shorter, so a 1024-byte buffer never truncates a real lock path.
+_DARWIN_MAXPATHLEN = 1024
+
+
+def _resolve_fd_path(fd_num: int, proc_entry: Path) -> str | None:
+    """Resolve an open file descriptor to its filesystem path.
+
+    On macOS uses ``fcntl(F_GETPATH)`` (``/dev/fd`` entries are char devices,
+    not symlinks); on Linux reads the ``/proc/self/fd/N`` symlink. Returns
+    ``None`` when the lookup fails (fd closed concurrently, not path-backed,
+    etc.).
+    """
+    try:
+        if sys.platform == "darwin":
+            import fcntl
+
+            f_getpath = getattr(fcntl, "F_GETPATH", 50)
+            raw = fcntl.fcntl(fd_num, f_getpath, b"\x00" * _DARWIN_MAXPATHLEN)
+            return raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+        return str(proc_entry.readlink())
+    except OSError:
+        return None
+
+
 def cleanup_leaked_lockfile_fds() -> int:
-    """Scan /proc/self/fd for open FDs pointing to deleted .lock files and close them.
+    """Scan the process's open FDs for ones pointing at deleted ``.lock`` files and close them.
 
     Returns the number of leaked FDs that were closed.
+
+    Cross-platform: walks ``/dev/fd`` on macOS (fdesc fs — entries are
+    character devices, not symlinks, so paths are resolved via
+    ``fcntl(F_GETPATH)``) and ``/proc/self/fd`` on Linux. Symmetric with
+    ``get_fd_usage`` above. The "deleted file" signal is
+    ``os.fstat(fd).st_nlink == 0`` on both platforms — a still-open fd whose
+    underlying inode has zero remaining hard links. That subsumes the
+    Linux-only ``" (deleted)"`` readlink suffix the previous implementation
+    relied on, and is the only signal that works on macOS at all (where the
+    function was previously a silent no-op because it only checked
+    ``/proc/self/fd``).
+
+    Without this dispatch, the ``AsyncFileLock`` lockfile-fd leak (issue #116)
+    accumulates unbounded on macOS until the process hits ``RLIMIT_NOFILE`` and
+    every subsequent ``send_message``/``reply_message`` fails with EMFILE.
     """
-    fd_dir = Path("/proc/self/fd")
+    fd_dir = Path("/dev/fd") if sys.platform == "darwin" else Path("/proc/self/fd")
     if not fd_dir.exists():
         return 0
     closed = 0
@@ -430,21 +475,28 @@ def cleanup_leaked_lockfile_fds() -> int:
                 fd_num = int(entry.name)
             except ValueError:
                 continue
+            path = _resolve_fd_path(fd_num, entry)
+            # Cheap name filter before the fstat syscall: only ever reap fds
+            # that look like our advisory lock files.
+            if not path or ".lock" not in path:
+                continue
+            # Cross-platform "deleted" signal: a still-open fd whose inode has
+            # zero remaining hard links. A live, on-disk lockfile has
+            # st_nlink >= 1 and is left untouched.
             try:
-                target = str(entry.readlink())
+                if os.fstat(fd_num).st_nlink != 0:
+                    continue
             except OSError:
                 continue
-            # Deleted lock files show up as "/path/to/.lock (deleted)"
-            if target.endswith("(deleted)") and ".lock" in target:
-                try:
-                    os.close(fd_num)
-                    closed += 1
-                    _logger.warning(
-                        "lockfile_fd.leaked_closed",
-                        extra={"fd": fd_num, "target": target},
-                    )
-                except OSError:
-                    pass
+            try:
+                os.close(fd_num)
+                closed += 1
+                _logger.warning(
+                    "lockfile_fd.leaked_closed",
+                    extra={"fd": fd_num, "target": path},
+                )
+            except OSError:
+                pass
     except OSError:
         pass
     if closed:
@@ -753,7 +805,19 @@ class AsyncFileLock:
         max_retries: int = 5,
     ) -> None:
         self._path = Path(path)
-        self._lock = SoftFileLock(str(self._path))
+        # thread_local=False is REQUIRED for correctness. We drive acquire()
+        # and release() through ``asyncio.to_thread`` (the default executor),
+        # so a single logical lock lifetime is spread across *different* worker
+        # threads. With filelock's default ``thread_local=True`` the underlying
+        # fd + lock_counter live in a per-thread context: an acquire on worker
+        # thread A and a release on worker thread B then disagree — thread B
+        # sees ``is_locked == False`` and ``release()`` becomes a silent no-op,
+        # leaving the fd open and the ``.lock``/``.commit.lock`` file on disk
+        # forever. The next writer blocks on a lock held by the still-alive
+        # server process and hangs indefinitely (issue #166; also feeds the
+        # leaked-fd accumulation tracked by #116). A shared (process-wide)
+        # context makes cross-thread acquire/release consistent and portable.
+        self._lock = SoftFileLock(str(self._path), thread_local=False)
         self._timeout = float(timeout_seconds)
         self._stale_timeout = float(max(stale_timeout_seconds, 0.0))
         self._max_retries = max_retries
@@ -1146,13 +1210,23 @@ class AsyncFileLock:
 
 @asynccontextmanager
 async def archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float = 60.0) -> AsyncIterator[None]:
-    """Context manager for safely mutating archive surfaces."""
+    """Context manager for safely mutating archive surfaces.
+
+    The lock is released in a ``finally`` no matter how the body terminates —
+    normal return, exception, or task cancellation/timeout. Acquisition is kept
+    inside the same ``try`` so that a cancellation delivered at the await
+    boundary *after* ``__aenter__`` returns (but before the body runs) still
+    routes through release; ``__aexit__`` is a no-op when nothing was acquired
+    (``_held`` stays False and no process lock is held), so the unconditional
+    finally is safe. This guarantees ``.archive.lock`` is never left wedged on
+    disk after an interrupted write (issue #166).
+    """
     lock = AsyncFileLock(archive.lock_path, timeout_seconds=timeout_seconds)
-    await lock.__aenter__()
     exc_type: type[BaseException] | None = None
     exc: BaseException | None = None
     tb: object | None = None
     try:
+        await lock.__aenter__()
         yield
     except BaseException as raised:
         exc_type = type(raised)
@@ -2199,9 +2273,19 @@ async def heal_archive_locks(settings: Settings, project_slug: str | None = None
         lock_path = cast(Path, lock_path_item)
         summary["locks_scanned"] += 1
         try:
-            metadata_path = lock_path.parent / f"{lock_path.name}.owner.json"
-            stale_timeout = 0.0 if await _to_thread(_path_exists, metadata_path) else AsyncFileLock(lock_path)._stale_timeout
-            lock = AsyncFileLock(lock_path, timeout_seconds=0.0, stale_timeout_seconds=stale_timeout)
+            # Use the configured age-based stale threshold UNCONDITIONALLY,
+            # regardless of whether the .owner.json sidecar is present. The
+            # previous behaviour forced ``stale_timeout=0`` whenever metadata
+            # existed, which disabled the age path and made ``heal_archive_locks``
+            # remove a lock only when the owning PID was dead. That diverged from
+            # ``collect_lock_status`` (used by ``doctor check``), which always
+            # applies the age threshold — so a lock wedged by a still-alive but
+            # interrupted server (issue #166) was reported as stale by
+            # ``doctor check`` yet skipped by ``doctor repair`` ("No stale locks
+            # to heal"). Sharing one staleness definition keeps check and repair
+            # in agreement: a lock is healed if its owner is provably gone OR its
+            # age exceeds the threshold.
+            lock = AsyncFileLock(lock_path, timeout_seconds=0.0)
             removed = await _to_thread(lock._cleanup_if_stale)
             if removed:
                 summary["locks_removed"].append(str(lock_path))

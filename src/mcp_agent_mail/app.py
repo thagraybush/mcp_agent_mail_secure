@@ -6805,8 +6805,10 @@ def build_mcp_server() -> FastMCP:
             project (excluding the sender). Mutually exclusive with explicit `to` recipients.
             Respects contact_policy settings — agents with block_all are skipped.
         topic : Optional[str]
-            Optional topic tag (alphanumeric + hyphens, max 64 chars). Stored on the message
-            for topic-based filtering via fetch_inbox(topic=...) or fetch_topic().
+            Optional topic tag (max 64 chars). Must start with a letter or digit and may
+            otherwise contain alphanumerics, '.', '_', or '-' — so beads_rust hierarchical
+            IDs like ``br-abc.1`` can be used verbatim. Stored on the message for topic-based
+            filtering via fetch_inbox(topic=...) or fetch_topic().
         auto_contact_if_blocked : Optional[bool]
             When ``True`` (and contact policy blocks delivery to one or more recipients), the
             server will attempt to resolve the block automatically:
@@ -6881,14 +6883,25 @@ def build_mcp_server() -> FastMCP:
         """
         project = await _get_project_by_identifier(project_key)
 
-        # Validate topic format if provided
+        # Validate topic format if provided.
+        #
+        # Topics must start with an alphanumeric character and may then contain
+        # alphanumerics plus '.', '_', '-'. Allowing dots lets agents use
+        # beads_rust hierarchical IDs (e.g. ``br-abc.1``) verbatim as topics
+        # without mangling. The leading-alphanumeric anchor rejects traversal
+        # shapes like ``.``, ``..``, ``../foo`` and dotfiles. Topics are only
+        # ever stored as a DB column value, used in an index, and displayed —
+        # they are NEVER used to build filesystem paths (thread_id/message_id
+        # are the path components) — so dots are safe here, but the anchor is
+        # kept as defense-in-depth regardless.
         if topic is not None:
             import re as _re
             topic = topic.strip()
-            if not topic or len(topic) > 64 or not _re.fullmatch(r"[A-Za-z0-9_-]+", topic):
+            if not topic or len(topic) > 64 or not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", topic):
                 raise ToolExecutionError(
                     "INVALID_TOPIC",
-                    f"Topic must be 1-64 alphanumeric/hyphen/underscore characters. Got: {topic!r}",
+                    "Topic must be 1-64 characters, start with a letter or digit, and "
+                    f"contain only alphanumerics, '.', '_', or '-'. Got: {topic!r}",
                     recoverable=True,
                     data={"argument": "topic", "provided": topic},
                 )

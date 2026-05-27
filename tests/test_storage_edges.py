@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures as _cf
 import contextlib
 import json
 import os
 import sqlite3
+import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,8 +22,11 @@ from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.db import get_sqlite_pre_restore_path, get_sqlite_sidecar_paths
 from mcp_agent_mail.storage import (
     AsyncFileLock,
+    cleanup_leaked_lockfile_fds,
+    collect_lock_status,
     create_diagnostic_backup,
     ensure_archive,
+    heal_archive_locks,
     list_backups,
     restore_from_backup,
 )
@@ -838,3 +844,177 @@ async def test_commit_queue_batch_ignores_cancelled_waiter(isolated_env, monkeyp
     assert second_request.future.exception() is None
     assert committed_messages == ["batch: 2 commits\n\n- first\n- second"]
     assert queue.stats["commits"] == 1
+
+
+# ============================================================================
+# cleanup_leaked_lockfile_fds — cross-platform deleted-lock-fd reaper (PR #164 / #116)
+# ============================================================================
+
+
+def test_cleanup_leaked_lockfile_fds_closes_deleted_lock_fd() -> None:
+    """A still-open fd pointing at an unlinked ``.lock`` file must be closed.
+
+    Reproduces the exact leak shape ``AsyncFileLock`` can leave behind (open the
+    lock file, unlink while the fd stays open). Before the cross-platform fix the
+    cleanup was a no-op on macOS (only checked ``/proc/self/fd``); the fix
+    dispatches ``/dev/fd`` vs ``/proc/self/fd`` and uses ``st_nlink == 0`` as the
+    deleted signal. On Linux (this CI) the ``/proc/self/fd`` path is exercised.
+    """
+    fd, path = tempfile.mkstemp(suffix=".lock")
+    try:
+        Path(path).unlink()
+        # Sanity-check the leak setup: fd is open, but the inode has no links.
+        assert os.fstat(fd).st_nlink == 0
+
+        closed = cleanup_leaked_lockfile_fds()
+
+        fd_dir = Path("/dev/fd") if sys.platform == "darwin" else Path("/proc/self/fd")
+        if fd_dir.exists():
+            assert closed >= 1, f"expected >=1 leaked lock fd closed; got {closed}"
+            # The fd must now be closed: any further syscall on it raises EBADF.
+            with pytest.raises(OSError):
+                os.fstat(fd)
+            fd = -1  # do not double-close in the finally
+        else:
+            # Platform without an fd directory: function early-returns 0.
+            assert closed == 0
+    finally:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def test_cleanup_leaked_lockfile_fds_skips_live_lock_fds(tmp_path: Path) -> None:
+    """Live, on-disk ``.lock`` fds (st_nlink >= 1) must NOT be touched."""
+    lock_path = tmp_path / "active.lock"
+    lock_path.touch()
+    fd = os.open(lock_path, os.O_RDONLY)
+    try:
+        assert os.fstat(fd).st_nlink == 1  # still on disk
+        cleanup_leaked_lockfile_fds()
+        # The live fd must still be usable (not closed) after cleanup.
+        assert os.fstat(fd).st_nlink == 1
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            lock_path.unlink()
+
+
+def test_cleanup_leaked_lockfile_fds_ignores_non_lock_deleted_fds() -> None:
+    """A deleted-but-open fd that is NOT a ``.lock`` file must be left alone."""
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    try:
+        Path(path).unlink()
+        assert os.fstat(fd).st_nlink == 0
+        cleanup_leaked_lockfile_fds()
+        # Non-lock fd survives: still a valid (deleted) inode we can fstat.
+        assert os.fstat(fd).st_nlink == 0
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+# ============================================================================
+# Lock release on interrupted writes + doctor staleness reconciliation (#166)
+# ============================================================================
+
+
+def test_async_file_lock_releases_across_executor_threads(tmp_path: Path) -> None:
+    """Regression for issue #166: acquire on one worker thread, release on another.
+
+    ``AsyncFileLock`` drives ``SoftFileLock.acquire``/``release`` through
+    ``asyncio.to_thread``, so a single lock lifetime can span different executor
+    threads. With filelock's default ``thread_local=True`` the release on a
+    different thread is a silent no-op — the fd stays open and the ``.lock`` file
+    is never removed, wedging every subsequent writer. ``AsyncFileLock`` must
+    construct the lock with ``thread_local=False`` so cross-thread release works.
+    """
+    lock_path = tmp_path / ".archive.lock"
+    lock = AsyncFileLock(lock_path)
+
+    ex_a = _cf.ThreadPoolExecutor(max_workers=1)
+    ex_b = _cf.ThreadPoolExecutor(max_workers=1)
+    try:
+        ex_a.submit(lambda: lock._lock.acquire(timeout=5)).result()
+        assert lock_path.exists(), "lock file should exist while held"
+        # Release on a DIFFERENT thread than the one that acquired.
+        ex_b.submit(lambda: lock._lock.release()).result()
+        assert not lock_path.exists(), (
+            "lock file must be removed after cross-thread release; a lingering "
+            "lock file means the thread-local context regression is back (#166)"
+        )
+    finally:
+        ex_a.shutdown(wait=True)
+        ex_b.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_archive_write_lock_releases_on_body_exception(tmp_path: Path, monkeypatch) -> None:
+    """The archive write lock is released even when the guarded body raises (#166)."""
+    monkeypatch.setenv("APP_ENVIRONMENT", "development")
+    from mcp_agent_mail.storage import ProjectArchive, archive_write_lock
+
+    lock_path = tmp_path / ".archive.lock"
+    # Only lock_path is exercised by archive_write_lock; the other fields satisfy
+    # the dataclass constructor (repo is never dereferenced on this path).
+    archive = ProjectArchive(
+        settings=get_settings(),
+        slug="t",
+        root=tmp_path,
+        repo=None,  # type: ignore[arg-type]
+        lock_path=lock_path,
+        repo_root=tmp_path,
+    )
+
+    with contextlib.suppress(RuntimeError):
+        async with archive_write_lock(archive, timeout_seconds=5.0):
+            assert lock_path.exists()
+            raise RuntimeError("simulated interrupted write")
+
+    # finally must have released the lock regardless of the exception.
+    assert not lock_path.exists(), "archive lock must be released after a failed write (#166)"
+    # And the lock must be immediately re-acquirable (not wedged).
+    async with archive_write_lock(archive, timeout_seconds=5.0):
+        assert lock_path.exists()
+    assert not lock_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_doctor_check_and_repair_agree_on_aged_live_lock(tmp_path: Path, monkeypatch) -> None:
+    """doctor check (collect_lock_status) and doctor repair (heal_archive_locks) must agree (#166).
+
+    An aged lock whose owner process is still alive (the wedged-server case) was
+    flagged stale by ``collect_lock_status`` but skipped by ``heal_archive_locks``
+    ("No stale locks to heal") because repair forced ``stale_timeout=0`` whenever
+    the ``.owner.json`` sidecar was present. After reconciliation both apply the
+    same age threshold.
+    """
+    settings = get_settings()
+    root = Path(settings.storage.root).expanduser().resolve()
+    proj_dir = root / "projects" / "wedged-proj"
+    proj_dir.mkdir(parents=True, exist_ok=True)
+
+    lock_path = proj_dir / ".archive.lock"
+    lock_path.touch()
+    # Aged well beyond the 180s default stale threshold...
+    aged = time.time() - 600
+    os.utime(lock_path, (aged, aged))
+    metadata_path = proj_dir / f"{lock_path.name}.owner.json"
+    # ...but owned by THIS still-alive process (the wedged-server shape).
+    metadata_path.write_text(json.dumps({"pid": os.getpid(), "created_ts": aged}))
+
+    # doctor check: must flag it as stale (age-based).
+    status = collect_lock_status(settings, project_slug="wedged-proj")
+    flagged = [
+        lock_info for lock_info in status["locks"]
+        if lock_info.get("stale_suspected") and lock_info.get("path") == str(lock_path)
+    ]
+    assert flagged, "doctor check should flag an aged lock as stale even with a live owner"
+
+    # doctor repair: must actually heal the very same lock.
+    result = await heal_archive_locks(settings, project_slug="wedged-proj")
+    assert str(lock_path) in result["locks_removed"], (
+        "doctor repair must heal the aged lock that doctor check flagged (#166)"
+    )
+    assert not lock_path.exists()
