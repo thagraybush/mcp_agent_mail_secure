@@ -1878,7 +1878,15 @@ async def _store_image(archive: ProjectArchive, path: Path, *, embed_policy: str
         width, height = img.size
         buffer_path = archive.attachments_dir
         await _to_thread(buffer_path.mkdir, parents=True, exist_ok=True)
-        digest = hashlib.sha1(data, usedforsecurity=False).hexdigest()
+        # Use SHA256 for new content-addressable writes.  SHA256 is collision-
+        # resistant in the cryptographic sense and avoids the theoretical
+        # SHAttered (2017) chosen-prefix collision risk present in SHA1.
+        # Legacy blobs already on disk keep their 40-char SHA1 filenames; the
+        # digest field in returned metadata uses the field name ``"sha1"`` for
+        # backward-compat with all existing consumers (the field now carries
+        # a 64-char SHA256 hex string for new content, 40-char SHA1 for legacy
+        # content already present on disk — both are opaque keys to callers).
+        digest = hashlib.sha256(data).hexdigest()
         target_dir = buffer_path / digest[:2]
         await _to_thread(target_dir.mkdir, parents=True, exist_ok=True)
         target_path = target_dir / f"{digest}.webp"
@@ -1977,15 +1985,17 @@ async def _write_json(path: Path, payload: dict[str, object]) -> None:
     await _write_text(path, content + "\n")
 
 
-async def _append_attachment_audit(archive: ProjectArchive, sha1: str, event: dict[str, object]) -> None:
+async def _append_attachment_audit(archive: ProjectArchive, digest: str, event: dict[str, object]) -> None:
     """Append a single JSON line audit record for an attachment digest.
 
-    Creates attachments/_audit/<sha1>.log if missing. Best-effort; failures are ignored.
+    Creates attachments/_audit/<digest>.log if missing. Best-effort; failures are ignored.
+    The digest is a SHA256 hex string for new content (64 chars) or a legacy SHA1
+    hex string (40 chars) for content written by older versions of this code.
     """
     try:
         audit_dir = archive.root / "attachments" / "_audit"
         await _to_thread(audit_dir.mkdir, parents=True, exist_ok=True)
-        audit_path = audit_dir / f"{sha1}.log"
+        audit_path = audit_dir / f"{digest}.log"
 
         def _append_line() -> None:
             line = json.dumps(event, sort_keys=True)

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import concurrent.futures as _cf
 import contextlib
+import hashlib
 import json
 import os
 import sqlite3
@@ -15,6 +16,7 @@ from pathlib import Path
 
 import pytest
 from fastmcp import Client
+from PIL import Image
 
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
@@ -1058,3 +1060,196 @@ async def test_doctor_check_and_repair_agree_on_aged_live_lock(tmp_path: Path, m
         "doctor repair must heal the aged lock that doctor check flagged (#166)"
     )
     assert not lock_path.exists()
+
+
+# ============================================================================
+# SHA256 content-addressable storage migration tests (F5)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_store_image_writes_sha256_path(isolated_env):
+    """New writes use SHA256 (64-char hex) filenames, not SHA1 (40-char).
+
+    Regression guard for the F5 upgrade: _store_image must derive the
+    content-addressable storage key from hashlib.sha256, producing a 64-char
+    hex digest.  The resulting .webp file must live under
+    ``attachments/<digest[:2]>/<digest>.webp`` inside the project archive.
+    """
+    from mcp_agent_mail.storage import _store_image
+
+    settings = get_settings()
+    archive = await ensure_archive(settings, "test-sha256-write")
+
+    # Build a minimal valid PNG in memory (1x1 red pixel)
+    img_buf = __import__("io").BytesIO()
+    pil = Image.new("RGB", (1, 1), color=(255, 0, 0))
+    pil.save(img_buf, format="PNG")
+    raw_bytes = img_buf.getvalue()
+
+    # Write the image to a temp file so _store_image can read it
+    img_file = archive.repo_root / "test_sha256_input.png"
+    img_file.write_bytes(raw_bytes)
+
+    try:
+        meta, rel_path = await _store_image(archive, img_file, embed_policy="file")
+
+        # The digest in the returned meta must be 64 hex chars (SHA256)
+        digest = meta["sha1"]  # field name kept for compat; value is now SHA256
+        assert isinstance(digest, str), "digest must be a string"
+        assert len(digest) == 64, (
+            f"SHA256 hex digest must be 64 chars, got {len(digest)}: {digest!r}"
+        )
+        # Verify it is a valid hex string
+        int(digest, 16)
+
+        # The actual file must exist at the expected SHA256-derived path
+        expected_path = archive.attachments_dir / digest[:2] / f"{digest}.webp"
+        assert expected_path.exists(), (
+            f"Expected webp at SHA256 path {expected_path} — file not found"
+        )
+
+        # rel_path must reference the SHA256 filename
+        assert digest in rel_path, (
+            f"rel_path {rel_path!r} must contain the SHA256 digest"
+        )
+
+        # The manifest file must exist and contain the sha1 field (compat key)
+        manifest_path = archive.root / "attachments" / "_manifests" / f"{digest}.json"
+        assert manifest_path.exists(), "per-attachment manifest must be written"
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["sha1"] == digest, "manifest sha1 field must match digest"
+
+        # Cross-check: SHA1 of the same bytes is 40 chars and DIFFERENT
+        sha1_digest = hashlib.sha1(raw_bytes, usedforsecurity=False).hexdigest()
+        assert len(sha1_digest) == 40
+        assert sha1_digest != digest, "SHA256 and SHA1 of same data must differ"
+
+        # The OLD SHA1-keyed path must NOT exist (we only write SHA256 now)
+        legacy_path = archive.attachments_dir / sha1_digest[:2] / f"{sha1_digest}.webp"
+        assert not legacy_path.exists(), (
+            "No SHA1-keyed webp should be written for new content"
+        )
+    finally:
+        img_file.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_legacy_sha1_blob_readable_alongside_sha256(isolated_env):
+    """Legacy SHA1-named blobs remain on disk; SHA256-named new blobs coexist.
+
+    This test simulates the migration scenario: a blob written by an older
+    version of the code (stored at the 40-char SHA1 path) still exists on
+    disk, and a new write produces a 64-char SHA256 path.  Both files must
+    be independently readable — no collision, no overwrite.
+    """
+    from mcp_agent_mail.storage import _store_image
+
+    settings = get_settings()
+    archive = await ensure_archive(settings, "test-sha256-legacy-coexist")
+
+    # Build two distinct minimal images
+    def _make_png(color: tuple[int, int, int]) -> bytes:
+        buf = __import__("io").BytesIO()
+        Image.new("RGB", (1, 1), color=color).save(buf, format="PNG")
+        return buf.getvalue()
+
+    red_bytes = _make_png((255, 0, 0))
+    blue_bytes = _make_png((0, 0, 255))
+
+    # Manually plant a "legacy" SHA1-keyed blob (simulating old code output)
+    sha1_of_red = hashlib.sha1(red_bytes, usedforsecurity=False).hexdigest()
+    legacy_dir = archive.attachments_dir / sha1_of_red[:2]
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    # Write a fake .webp at the SHA1 path (content doesn't need to be real webp)
+    legacy_webp = legacy_dir / f"{sha1_of_red}.webp"
+    legacy_webp.write_bytes(b"LEGACY_BLOB")
+
+    # Now write a fresh image via _store_image (should produce SHA256 path)
+    blue_file = archive.repo_root / "test_blue_input.png"
+    blue_file.write_bytes(blue_bytes)
+    try:
+        meta, _rel_path = await _store_image(archive, blue_file, embed_policy="file")
+        new_digest = meta["sha1"]
+
+        assert len(new_digest) == 64, "fresh write must use 64-char SHA256 digest"
+
+        # Both paths must coexist and be readable
+        assert legacy_webp.exists(), "legacy SHA1 blob must not be disturbed"
+        assert legacy_webp.read_bytes() == b"LEGACY_BLOB", "legacy blob content must be intact"
+
+        new_webp = archive.attachments_dir / new_digest[:2] / f"{new_digest}.webp"
+        assert new_webp.exists(), "SHA256-keyed new blob must exist"
+        assert new_webp.stat().st_size > 0, "new blob must be non-empty"
+
+        # Sanity: SHA1 of blue_bytes vs SHA1 of red_bytes differ
+        sha1_of_blue = hashlib.sha1(blue_bytes, usedforsecurity=False).hexdigest()
+        assert sha1_of_blue != sha1_of_red, "test images must have distinct SHA1 digests"
+
+        # No cross-contamination: the new write must not touch the legacy file
+        assert legacy_webp.read_bytes() == b"LEGACY_BLOB"
+    finally:
+        blue_file.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_store_image_sha256_via_mcp_send_message(isolated_env, monkeypatch):
+    """End-to-end: send_message with an image attachment produces a SHA256 path.
+
+    Verifies the full MCP → _store_image pipeline: the attachment metadata
+    returned in the delivery payload must carry a 64-char digest under the
+    ``sha1`` key (compat field name).  We enable ALLOW_ABSOLUTE_ATTACHMENT_PATHS
+    so that the absolute image path in the markdown body is resolved and stored.
+    """
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
+    from mcp_agent_mail import config as _conf
+    _conf.clear_settings_cache()
+
+    settings = get_settings()
+    storage_root = Path(settings.storage.root).expanduser().resolve()
+
+    # Build a 32x32 PNG — large enough to exceed the 128-byte inline threshold
+    # after WebP conversion, ensuring a "file" type attachment with a path.
+    img_buf = __import__("io").BytesIO()
+    Image.new("RGB", (32, 32), color=(0, 128, 255)).save(img_buf, format="PNG")
+    img_path = storage_root.parent / "test_sha256_e2e.png"
+    img_path.write_bytes(img_buf.getvalue())
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        reg = await client.call_tool(
+            "register_agent",
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+        )
+        agent_name = reg.data.get("name", "BlueLake")
+        res = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "Backend",
+                "sender_name": agent_name,
+                "to": [agent_name],
+                "subject": "SHA256 path test",
+                "body_md": f"![img]({img_path})",
+            },
+        )
+        deliveries = res.data.get("deliveries") or []
+        assert deliveries, "at least one delivery expected"
+        attachments = deliveries[0].get("payload", {}).get("attachments") or []
+        assert attachments, "attachment must be present in delivery"
+
+        att = attachments[0]
+        digest = att.get("sha1")
+        assert digest is not None, "attachment metadata must include 'sha1' field"
+        assert len(digest) == 64, (
+            f"digest in attachment metadata must be 64-char SHA256, got {len(digest)}: {digest!r}"
+        )
+
+        # For file-type attachments, also verify the .webp exists on disk.
+        if att.get("type") == "file":
+            att_path = att.get("path")
+            assert att_path, "file attachment must have a 'path' field"
+            full_path = storage_root / att_path
+            assert full_path.exists(), f"webp at {att_path} not found on disk"
+
+    img_path.unlink(missing_ok=True)
