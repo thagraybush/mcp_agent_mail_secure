@@ -4866,12 +4866,10 @@ def build_mcp_server() -> FastMCP:
         if isinstance(cached, str):
             return cached
         orphan_key = f"orphan:{uuid.uuid4()}"
-        try:
+        # ctx refuses attribute assignment; multi-lookup consistency
+        # degrades to "best effort" but a single lookup still works.
+        with suppress(Exception):
             ctx._mcp_agent_mail_orphan_key = orphan_key  # type: ignore[attr-defined]
-        except Exception:
-            # ctx refuses attribute assignment; multi-lookup consistency
-            # degrades to "best effort" but a single lookup still works.
-            pass
         return orphan_key
 
     def _prune_expired_session_bindings(now: float) -> None:
@@ -5173,7 +5171,6 @@ def build_mcp_server() -> FastMCP:
     ) -> dict[str, Any]:
         # Re-fetch settings at call time so tests that mutate env + clear cache take effect
         settings = get_settings()
-        call_start = time.perf_counter()
         if not to_names and not cc_names and not bcc_names:
             raise ValueError("At least one recipient must be specified.")
         def _unique(items: Sequence[str]) -> list[str]:

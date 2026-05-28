@@ -1498,7 +1498,7 @@ async def write_file_reservation_records(
         normalized_file_reservation = dict(file_reservation)
         normalized_file_reservation["path_pattern"] = path_pattern
         normalized_file_reservation.pop("path", None)
-        digest = hashlib.sha1(path_pattern.encode("utf-8")).hexdigest()
+        digest = hashlib.sha1(path_pattern.encode("utf-8"), usedforsecurity=False).hexdigest()
         # Legacy path: digest of path_pattern (kept to avoid stale artifacts in existing installs)
         legacy_path = archive.root / "file_reservations" / f"{digest}.json"
         await _write_json(legacy_path, normalized_file_reservation)
@@ -1862,7 +1862,7 @@ async def _store_image(archive: ProjectArchive, path: Path, *, embed_policy: str
         width, height = img.size
         buffer_path = archive.attachments_dir
         await _to_thread(buffer_path.mkdir, parents=True, exist_ok=True)
-        digest = hashlib.sha1(data).hexdigest()
+        digest = hashlib.sha1(data, usedforsecurity=False).hexdigest()
         target_dir = buffer_path / digest[:2]
         await _to_thread(target_dir.mkdir, parents=True, exist_ok=True)
         target_path = target_dir / f"{digest}.webp"
