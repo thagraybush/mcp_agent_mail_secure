@@ -915,6 +915,46 @@ def test_cleanup_leaked_lockfile_fds_ignores_non_lock_deleted_fds() -> None:
             os.close(fd)
 
 
+def test_cleanup_leaked_lockfile_fds_ignores_lockfile_substring_paths() -> None:
+    """A deleted fd whose path contains ``.lock`` as a substring but whose basename
+    does NOT end with ``.lock`` (e.g. ``/tmp/.lockfile-fooXYZ``) must NOT be reaped.
+
+    This guards the anchored-basename predicate introduced to replace the
+    over-broad ``".lock" not in path`` substring check.  The old check would
+    have matched ``.lockfile-fooXYZ`` (substring match), silently closing an fd
+    that belongs to an unrelated library.  The new check requires the basename
+    to end with ``.lock`` or contain ``.lock.`` — neither is true for
+    ``.lockfile-fooXYZ``.
+    """
+    fd_dir = Path("/dev/fd") if sys.platform == "darwin" else Path("/proc/self/fd")
+    if not fd_dir.exists():
+        pytest.skip("no fd directory on this platform")
+
+    # Create a deleted-but-open file whose path contains ".lock" as a substring
+    # but whose basename is ".lockfile-fooXYZ" — NOT ending with ".lock".
+    fd, path = tempfile.mkstemp(prefix=".lockfile-foo", suffix="XYZ")
+    try:
+        assert ".lock" in path, "sanity: substring '.lock' must be present in path"
+        base = Path(path).name
+        assert not base.endswith(".lock"), f"sanity: basename {base!r} must NOT end with '.lock'"
+        Path(path).unlink()
+        assert os.fstat(fd).st_nlink == 0  # confirmed deleted (leaked fd shape)
+
+        closed = cleanup_leaked_lockfile_fds()
+
+        # The fd must still be open — cleanup must NOT have reaped it.
+        assert os.fstat(fd).st_nlink == 0, (
+            f"cleanup_leaked_lockfile_fds incorrectly reaped fd for {path!r} "
+            f"(basename {base!r}) — anchored-basename filter is broken"
+        )
+        # closed count should not include our fd (it may be > 0 if other genuine
+        # leaked lock fds existed in the process, but our fd must survive).
+        _ = closed  # not asserting == 0 to avoid flakiness from concurrent tests
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
 # ============================================================================
 # Lock release on interrupted writes + doctor staleness reconciliation (#166)
 # ============================================================================

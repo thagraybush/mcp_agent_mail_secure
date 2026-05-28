@@ -477,8 +477,21 @@ def cleanup_leaked_lockfile_fds() -> int:
                 continue
             path = _resolve_fd_path(fd_num, entry)
             # Cheap name filter before the fstat syscall: only ever reap fds
-            # that look like our advisory lock files.
-            if not path or ".lock" not in path:
+            # that look like our advisory lock files.  Anchor on the basename
+            # so that unrelated paths containing ".lock" as a substring (e.g.
+            # ``/tmp/.lockfile-fooXYZ``, ``/var/log/log.locked-archive``) are
+            # never matched.  All AsyncFileLock paths this project creates end
+            # with ``.lock`` (e.g. ``.archive.lock``, ``.commit.lock``,
+            # ``<thread>.md.lock``) or use a ``.lock.<suffix>`` extension
+            # style — both are covered by checking the basename.
+            # On Linux, /proc/self/fd symlinks for deleted inodes carry a
+            # " (deleted)" suffix — strip it before basename extraction so the
+            # ".lock" ending is visible.
+            if not path:
+                continue
+            clean_path = path.removesuffix(" (deleted)")
+            base = Path(clean_path).name
+            if not (base.endswith(".lock") or ".lock." in base):
                 continue
             # Cross-platform "deleted" signal: a still-open fd whose inode has
             # zero remaining hard links. A live, on-disk lockfile has
