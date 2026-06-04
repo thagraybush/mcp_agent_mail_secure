@@ -959,23 +959,32 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
         # JWT auth (if enabled)
         if self._jwt_enabled:
             auth_header = request.headers.get("Authorization", "")
-            if not auth_header.startswith("Bearer "):
-                return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
-            token = auth_header.split(" ", 1)[1].strip()
-            claims_dict = await self._decode_jwt(token)
-            if claims_dict is None:
-                return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
-            claims = cast(dict[str, Any], claims_dict)
-            request.state.jwt_claims = claims
-            roles_raw = claims.get(self.settings.http.jwt_role_claim, [])
-            if isinstance(roles_raw, str):
-                roles = {roles_raw}
-            elif isinstance(roles_raw, (list, tuple)):
-                roles = {str(r) for r in roles_raw}
-            else:
-                roles = set()
-            if not roles:
+            # #210: when JWT is enabled, a valid *static* bearer is still accepted
+            # as the OR-alternative to a JWT (the outer BearerAuthMiddleware defers
+            # Bearer requests here without distinguishing the two). Check it first so
+            # static-bearer clients keep working once JWT is turned on; a static
+            # bearer is treated exactly as it is when JWT is disabled (default role).
+            static_token = getattr(self.settings.http, "bearer_token", "") or ""
+            if static_token and hmac.compare_digest(auth_header, f"Bearer {static_token}"):
                 roles = {self._default_role}
+            else:
+                if not auth_header.startswith("Bearer "):
+                    return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+                token = auth_header.split(" ", 1)[1].strip()
+                claims_dict = await self._decode_jwt(token)
+                if claims_dict is None:
+                    return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+                claims = cast(dict[str, Any], claims_dict)
+                request.state.jwt_claims = claims
+                roles_raw = claims.get(self.settings.http.jwt_role_claim, [])
+                if isinstance(roles_raw, str):
+                    roles = {roles_raw}
+                elif isinstance(roles_raw, (list, tuple)):
+                    roles = {str(r) for r in roles_raw}
+                else:
+                    roles = set()
+                if not roles:
+                    roles = {self._default_role}
         else:
             roles = {self._default_role}
             # Elevate localhost to writer when unauthenticated localhost is allowed

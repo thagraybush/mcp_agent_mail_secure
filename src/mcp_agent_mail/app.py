@@ -428,12 +428,17 @@ def _instrument_tool(
                 _normalized_fmt, _fmt_ok = _normalize_output_format(format_value)
                 if not _fmt_ok:
                     metrics["errors"] += 1
-                    raise ToolExecutionError(
+                    _fmt_exc = ToolExecutionError(
                         "INVALID_ARGUMENT",
                         f"Invalid format '{format_value}'. Expected 'json' or 'toon'.",
                         recoverable=True,
                         data={"tool": tool_name, "argument": "format", "provided": format_value},
                     )
+                    # This validation runs before the try/finally, so emit the
+                    # structured error log here rather than silently skipping the
+                    # instrumentation every other tool-error path goes through (#177).
+                    _record_tool_error(tool_name, _fmt_exc)
+                    raise _fmt_exc
             if isinstance(ctx, Context) and meta["capabilities"]:
                 required_caps = set(cast(list[str], meta["capabilities"]))
                 _enforce_capabilities(ctx, required_caps, tool_name)
@@ -13795,9 +13800,7 @@ def build_mcp_server() -> FastMCP:
                     project = parsed["project"][0]
                 if agent_token is None and parsed.get("agent_token"):
                     agent_token = parsed["agent_token"][0]
-                if parsed.get("limit"):
-                    with suppress(Exception):
-                        limit = int(parsed["limit"][0])
+                limit = _parse_resource_limit(parsed, default=limit)
                 format_value = format_value or _extract_format_param(parsed)
             except Exception:
                 pass
@@ -13868,9 +13871,7 @@ def build_mcp_server() -> FastMCP:
                     project = parsed["project"][0]
                 if agent_token is None and parsed.get("agent_token"):
                     agent_token = parsed["agent_token"][0]
-                if parsed.get("limit"):
-                    with suppress(Exception):
-                        limit = int(parsed["limit"][0])
+                limit = _parse_resource_limit(parsed, default=limit)
                 format_value = format_value or _extract_format_param(parsed)
             except Exception:
                 pass
@@ -13954,9 +13955,7 @@ def build_mcp_server() -> FastMCP:
                 if parsed.get("ttl_seconds"):
                     with suppress(Exception):
                         ttl_seconds = int(parsed["ttl_seconds"][0])
-                if parsed.get("limit"):
-                    with suppress(Exception):
-                        limit = int(parsed["limit"][0])
+                limit = _parse_resource_limit(parsed, default=limit)
                 format_value = format_value or _extract_format_param(parsed)
             except Exception:
                 pass
@@ -14045,9 +14044,7 @@ def build_mcp_server() -> FastMCP:
                 if parsed.get("ttl_minutes"):
                     with suppress(Exception):
                         ttl_minutes = int(parsed["ttl_minutes"][0])
-                if parsed.get("limit"):
-                    with suppress(Exception):
-                        limit = int(parsed["limit"][0])
+                limit = _parse_resource_limit(parsed, default=limit)
                 format_value = format_value or _extract_format_param(parsed)
             except Exception:
                 pass
@@ -14128,9 +14125,7 @@ def build_mcp_server() -> FastMCP:
                     project = parsed["project"][0]
                 if agent_token is None and parsed.get("agent_token"):
                     agent_token = parsed["agent_token"][0]
-                if parsed.get("limit"):
-                    with suppress(Exception):
-                        limit = int(parsed["limit"][0])
+                limit = _parse_resource_limit(parsed, default=limit)
                 format_value = format_value or _extract_format_param(parsed)
             except Exception:
                 pass
@@ -14192,9 +14187,7 @@ def build_mcp_server() -> FastMCP:
                     project = parsed["project"][0]
                 if agent_token is None and parsed.get("agent_token"):
                     agent_token = parsed["agent_token"][0]
-                if parsed.get("limit"):
-                    with suppress(Exception):
-                        limit = int(parsed["limit"][0])
+                limit = _parse_resource_limit(parsed, default=limit)
                 format_value = format_value or _extract_format_param(parsed)
             except Exception:
                 pass

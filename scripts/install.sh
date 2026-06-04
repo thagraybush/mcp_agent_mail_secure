@@ -605,11 +605,24 @@ update_existing_repo() {
   # Guard against data loss: a hard reset to origin/BRANCH silently discards any
   # local commits that have not been pushed. Only fast-forward when HEAD is an
   # ancestor of origin/BRANCH; if local history has diverged, refuse to reset.
-  if ! (cd "${repo_path}" && git merge-base --is-ancestor HEAD "origin/${BRANCH}" 2>/dev/null); then
-    warn "Local repo has commits not on origin/${BRANCH}; refusing to reset (would discard your work)"
-    warn "Resolve manually: cd '${repo_path}' && git log --oneline origin/${BRANCH}..HEAD"
-    record_summary "Repo: update skipped (local commits diverge from origin/${BRANCH})"
-    return 0
+  #
+  # The guard needs real history. This clone is shallow (`--depth 1`), so
+  # `merge-base --is-ancestor` cannot connect HEAD to the fetched tip and would
+  # return non-zero for EVERY update — even an ordinary no-local-commits
+  # fast-forward. Deepen the branch first so ancestry is genuinely determinable;
+  # only enforce the guard once we actually have the history to evaluate it.
+  if [[ "$(cd "${repo_path}" && git rev-parse --is-shallow-repository 2>/dev/null)" == "true" ]]; then
+    (cd "${repo_path}" && git fetch origin "${BRANCH}" --unshallow 2>/dev/null) \
+      || (cd "${repo_path}" && git fetch origin "${BRANCH}" --depth 200 2>/dev/null) \
+      || true
+  fi
+  if [[ "$(cd "${repo_path}" && git rev-parse --is-shallow-repository 2>/dev/null)" != "true" ]]; then
+    if ! (cd "${repo_path}" && git merge-base --is-ancestor HEAD "origin/${BRANCH}" 2>/dev/null); then
+      warn "Local repo has commits not on origin/${BRANCH}; refusing to reset (would discard your work)"
+      warn "Resolve manually: cd '${repo_path}' && git log --oneline origin/${BRANCH}..HEAD"
+      record_summary "Repo: update skipped (local commits diverge from origin/${BRANCH})"
+      return 0
+    fi
   fi
 
   # Stash any local changes to avoid conflicts

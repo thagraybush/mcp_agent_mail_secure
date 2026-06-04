@@ -195,7 +195,9 @@ def test_share_export_end_to_end(monkeypatch, tmp_path: Path) -> None:
     assert (viewer_dir / "styles.css").is_file()
     assert (viewer_dir / "viewer.js").is_file()
     index_content = (viewer_dir / "index.html").read_text(encoding="utf-8")
-    assert "Static Viewer" in index_content
+    # The legacy "Static Viewer" compat marker was removed (#224); assert the
+    # stable page title instead, which still proves index.html was exported.
+    assert "Agent Mail Viewer" in index_content
 
     zip_path = output_dir.with_suffix(".zip")
     assert zip_path.is_file()
@@ -267,8 +269,10 @@ def test_viewer_playwright_smoke(monkeypatch, tmp_path: Path) -> None:
             page = context.new_page()
             server_host = host or "127.0.0.1"
             page.goto(f"http://{server_host}:{port}/viewer/index.html", wait_until="networkidle")
-            page.wait_for_selector("#message-list li")
-            first_entry = page.inner_text("#message-list li:nth-child(1)")
+            # The legacy #message-list shim was removed (#224); the live viewer
+            # renders rows as `.message-row` divs inside the virtual list.
+            page.wait_for_selector("#virtual-message-list .message-row")
+            first_entry = page.inner_text("#virtual-message-list .message-row")
             assert "Integration Test" in (first_entry or "")
             # Ensure sanitization removed inline script execution.
             xss_value = page.evaluate("window._xss || null")

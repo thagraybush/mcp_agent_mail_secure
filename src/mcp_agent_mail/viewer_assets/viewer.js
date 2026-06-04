@@ -991,12 +991,26 @@ function viewerController() {
       }
       if (tokens.length === 0) return new Set();
 
+      // 1b) Insert an implicit AND between adjacent operands so a bare
+      // multi-word query like `hello world` is treated as `hello AND world`
+      // (#222). Without this, the tokens produce a malformed RPN (multiple
+      // values left on the stack) and buildAst returns null → zero results.
+      const endsOperand = (t) => !!t && (t.kind === 'term' || t.kind === ')');
+      const startsOperand = (t) => !!t && (t.kind === 'term' || t.kind === '(' || (t.kind === 'op' && t.value === 'NOT'));
+      const expandedTokens = [];
+      for (let i = 0; i < tokens.length; i++) {
+        if (i > 0 && endsOperand(tokens[i - 1]) && startsOperand(tokens[i])) {
+          expandedTokens.push({ kind: 'op', value: 'AND' });
+        }
+        expandedTokens.push(tokens[i]);
+      }
+
       // 2) Shunting-yard → RPN with precedence: NOT(3) > AND(2) > OR(1)
       const prec = { NOT: 3, AND: 2, OR: 1 };
       const rightAssoc = { NOT: true };
       const output = [];
       const ops = [];
-      for (const t of tokens) {
+      for (const t of expandedTokens) {
         if (t.kind === 'term') {
           output.push(t);
         } else if (t.kind === 'op') {

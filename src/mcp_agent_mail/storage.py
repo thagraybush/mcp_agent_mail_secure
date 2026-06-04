@@ -1643,7 +1643,10 @@ async def write_message_bundle(
             thread_id_obj.strip(),
             {
                 "from": sender,
-                "to": list(recipients),
+                # Exclude bcc recipients (#186): the thread digest is a shared
+                # file (messages/threads/<id>.md) readable by every thread
+                # participant, so it must not reveal who was blind-copied.
+                "to": [r for r in recipients if r not in bcc_names],
                 "subject": message.get("subject", "") or "",
                 "created": timestamp_str,
             },
