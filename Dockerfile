@@ -89,14 +89,17 @@ COPY --from=tru-builder /tru /usr/local/bin/tru
 
 WORKDIR /app
 
-# Copy project metadata and sync deps first for better caching
-# README.md is required by hatchling since pyproject.toml references it
+# Copy project metadata and sync deps first for better caching.
+# README.md is required by hatchling since pyproject.toml references it.
 COPY pyproject.toml README.md ./
-# Install runtime deps
-RUN uv sync --no-dev
+# Install runtime deps only — the project itself (hatchling wheel from
+# src/mcp_agent_mail) can't be built yet because src/ isn't present, so defer
+# its install with --no-install-project to keep this dependency layer cached.
+RUN uv sync --no-dev --no-install-project
 
-# Copy source
+# Copy source, then install the project itself now that src/ exists.
 COPY src ./src
+RUN uv sync --no-dev
 
 # Defaults suitable for container
 ENV HTTP_HOST=0.0.0.0 \
