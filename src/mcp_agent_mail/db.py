@@ -762,7 +762,7 @@ async def ensure_schema(settings: Settings | None = None) -> None:
 
 def reset_database_state() -> None:
     """Test helper to reset global engine/session state."""
-    global _engine, _session_factory, _schema_ready, _schema_lock
+    global _engine, _session_factory, _schema_ready, _schema_lock, _QUERY_HOOKS_INSTALLED
     # Dispose any existing engine/pool first to avoid leaking file descriptors across tests.
     if _engine is not None:
         engine = _engine
@@ -776,6 +776,9 @@ def reset_database_state() -> None:
     _session_factory = None
     _schema_ready = False
     _schema_lock = None
+    # Query hooks bind to the disposed engine; reset the one-shot flag so the
+    # rebuilt engine gets re-instrumented on the next init_engine() call.
+    _QUERY_HOOKS_INSTALLED = False
     # Tests frequently mutate env vars; keep settings cache in sync with DB resets.
     clear_settings_cache()
 
@@ -876,7 +879,8 @@ def _setup_fts(connection: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_messages_sender_created ON messages(sender_id, created_ts DESC)"
     )
     connection.exec_driver_sql(
-        "CREATE INDEX IF NOT EXISTS idx_messages_project_created ON messages(project_id, created_ts DESC)"
+        "CREATE INDEX IF NOT EXISTS idx_messages_project_created_desc "
+        "ON messages(project_id, created_ts DESC)"
     )
     connection.exec_driver_sql(
         "CREATE INDEX IF NOT EXISTS idx_file_reservations_expires_ts ON file_reservations(expires_ts)"
@@ -889,7 +893,7 @@ def _setup_fts(connection: Any) -> None:
         "ON message_recipients(agent_id, message_id)"
     )
     connection.exec_driver_sql(
-        "CREATE INDEX IF NOT EXISTS idx_messages_project_sender_created "
+        "CREATE INDEX IF NOT EXISTS idx_messages_project_sender_created_desc "
         "ON messages(project_id, sender_id, created_ts DESC)"
     )
     connection.exec_driver_sql(

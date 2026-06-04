@@ -1831,6 +1831,11 @@ def copy_viewer_assets(output_dir: Path) -> None:
     # Attempt to copy from live source tree first
     source_tree = Path(__file__).parent / "viewer_assets"
     if source_tree.exists() and source_tree.is_dir():
+        # Verify vendor asset checksums on the source-tree path too (issue
+        # #219): previously this branch returned before any verification, so a
+        # tampered/stale vendored asset in the source tree was copied into the
+        # export (and later SRI-hashed) without ever being checked.
+        _verify_viewer_vendor_assets(source_tree)
         for src_path in sorted(p for p in source_tree.rglob("*") if p.is_file()):
             rel = src_path.relative_to(source_tree)
             dest = viewer_root / rel
@@ -1856,8 +1861,9 @@ def copy_viewer_assets(output_dir: Path) -> None:
     _walk(package_root, Path())
 
 
-def _load_vendor_manifest() -> dict[str, Any]:
-    manifest_path = resources.files("mcp_agent_mail.viewer_assets") / "vendor_manifest.json"
+def _load_vendor_manifest(base: Any | None = None) -> dict[str, Any]:
+    asset_base = base if base is not None else resources.files("mcp_agent_mail.viewer_assets")
+    manifest_path = asset_base / "vendor_manifest.json"
     try:
         with manifest_path.open("r", encoding="utf-8") as handle:
             return cast(dict[str, Any], json.load(handle))
@@ -1865,9 +1871,10 @@ def _load_vendor_manifest() -> dict[str, Any]:
         raise ShareExportError("Viewer asset manifest missing; reinstall package.") from exc
 
 
-def _verify_viewer_vendor_assets() -> None:
-    manifest = _load_vendor_manifest()
-    vendor_root = resources.files("mcp_agent_mail.viewer_assets") / "vendor"
+def _verify_viewer_vendor_assets(base: Any | None = None) -> None:
+    asset_base = base if base is not None else resources.files("mcp_agent_mail.viewer_assets")
+    manifest = _load_vendor_manifest(asset_base)
+    vendor_root = asset_base / "vendor"
     for manifest_group in manifest.values():
         files = manifest_group.get("files", {})
         for filename, meta in files.items():

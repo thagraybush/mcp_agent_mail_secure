@@ -420,6 +420,20 @@ def _instrument_tool(
             bound = _bind_arguments(signature, args, kwargs)
             ctx = bound.arguments.get("ctx")
             format_value = bound.arguments.get("format")
+            # Pre-validate the output `format` BEFORE running the wrapped tool
+            # (issue #177). Previously an invalid format was only caught while
+            # encoding the result, so the tool's side effects (e.g. sending a
+            # message) had already happened before the request was rejected.
+            if format_value is not None:
+                _normalized_fmt, _fmt_ok = _normalize_output_format(format_value)
+                if not _fmt_ok:
+                    metrics["errors"] += 1
+                    raise ToolExecutionError(
+                        "INVALID_ARGUMENT",
+                        f"Invalid format '{format_value}'. Expected 'json' or 'toon'.",
+                        recoverable=True,
+                        data={"tool": tool_name, "argument": "format", "provided": format_value},
+                    )
             if isinstance(ctx, Context) and meta["capabilities"]:
                 required_caps = set(cast(list[str], meta["capabilities"]))
                 _enforce_capabilities(ctx, required_caps, tool_name)
@@ -1461,6 +1475,64 @@ def _validate_iso_timestamp(raw_value: Optional[str], param_name: str = "timesta
         ) from None
 
 
+def _validate_limit(limit: int, *, param_name: str = "limit", max_limit: int = 1000) -> int:
+    """Validate and clamp a result-set `limit` to shared bounds.
+
+    Rejects values below 1 with a recoverable ``INVALID_LIMIT`` error and clamps
+    values above ``max_limit`` (default 1000). This is the single source of truth
+    for limit bounds shared across messaging/search tools and the resource
+    handlers so they cannot diverge (issues #178, #191, #202).
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool):
+        raise ToolExecutionError(
+            error_type="INVALID_LIMIT",
+            message=f"{param_name} must be an integer, got {limit!r}.",
+            recoverable=True,
+            data={"provided": limit, "min": 1, "max": max_limit},
+        )
+    if limit < 1:
+        raise ToolExecutionError(
+            error_type="INVALID_LIMIT",
+            message=f"{param_name} must be at least 1, got {limit}. Use a positive integer.",
+            recoverable=True,
+            data={"provided": limit, "min": 1, "max": max_limit},
+        )
+    if limit > max_limit:
+        return max_limit
+    return limit
+
+
+def _parse_resource_limit(
+    parsed: dict[str, list[str]],
+    *,
+    default: int,
+    key: str = "limit",
+    max_limit: int = 1000,
+) -> int:
+    """Parse and validate a resource query-string ``limit`` value.
+
+    Resource handlers historically did ``limit = int(parsed["limit"][0])``
+    inside ``suppress(Exception)`` with no bounds, so a malformed or negative
+    value was silently ignored (falling back to an unbounded ``.limit(limit)``
+    against the DB). Route every resource limit through the same
+    ``_validate_limit`` bounds the tools enforce so the resource and tool
+    surfaces cannot diverge (issue #178).
+    """
+    raw = parsed.get(key)
+    if not raw:
+        return _validate_limit(default, param_name=key, max_limit=max_limit)
+    try:
+        candidate = int(raw[0])
+    except (TypeError, ValueError):
+        raise ToolExecutionError(
+            error_type="INVALID_LIMIT",
+            message=f"{key} must be an integer, got {raw[0]!r}.",
+            recoverable=True,
+            data={"provided": raw[0], "min": 1, "max": max_limit},
+        ) from None
+    return _validate_limit(candidate, param_name=key, max_limit=max_limit)
+
+
 def _validate_program_model(program: str, model: str) -> None:
     """Validate that program and model are non-empty strings.
 
@@ -1797,7 +1869,57 @@ def _message_frontmatter(
     )
     return data
 
-def _compute_project_slug(human_key: str) -> str:
+
+def _normalize_git_remote(url: Optional[str]) -> Optional[str]:
+    """Normalize a git remote URL to a privacy-safe ``host/owner/repo`` string.
+
+    Single shared implementation used by every identity call site so that the
+    project slug and project UID can never disagree. Supports SCP-like
+    (``git@host:owner/repo.git``) and URL forms, strips a trailing ``.git``,
+    collapses duplicate slashes, and keeps the LAST two path segments so nested
+    group paths (e.g. GitLab subgroups ``group/subgroup/repo``) normalize to the
+    actual ``owner/repo`` rather than the top-level group.
+    """
+    if not url:
+        return None
+    u = url.strip()
+    try:
+        host = ""
+        path = ""
+        # SCP-like: git@host:owner/repo.git
+        if "@" in u and ":" in u and not u.startswith(("http://", "https://", "ssh://", "git://")):
+            at_pos = u.find("@")
+            colon_pos = u.find(":", at_pos + 1)
+            if colon_pos != -1:
+                host = u[at_pos + 1 : colon_pos]
+                path = u[colon_pos + 1 :]
+        else:
+            from urllib.parse import urlparse as _urlparse
+
+            pr = _urlparse(u)
+            host = pr.hostname or ""
+            # Some ssh URLs include port; urlparse drops it from hostname already.
+            path = pr.path or ""
+        host = host.lower()
+        if not host:
+            return None
+        path = path.lstrip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        # collapse duplicate slashes
+        while "//" in path:
+            path = path.replace("//", "/")
+        parts = [seg for seg in path.split("/") if seg]
+        if len(parts) < 2:
+            return None
+        # Keep the last two segments (owner/repo); supports nested group paths.
+        owner, repo_name = parts[-2].lower(), parts[-1].lower()
+        return f"{host}/{owner}/{repo_name}"
+    except Exception:
+        return None
+
+
+def _compute_project_slug(human_key: str, mode_override: Optional[str] = None) -> str:
     """
     Compute the project slug with strict backward compatibility by default.
     When worktree-friendly behavior is enabled, we still default to 'dir' mode
@@ -1811,34 +1933,13 @@ def _compute_project_slug(human_key: str) -> str:
     def _short_sha1(text: str, n: int = 10) -> str:
         return hashlib.sha1(text.encode("utf-8")).hexdigest()[:n]
 
-    def _norm_remote(url: str | None) -> str | None:
-        if not url:
-            return None
-        url = url.strip()
-        try:
-            if url.startswith("git@"):
-                host = url.split("@", 1)[1].split(":", 1)[0]
-                path = url.split(":", 1)[1]
-            else:
-                from urllib.parse import urlparse as _urlparse
+    # Delegate to the single shared normalizer so slug/uid can never diverge.
+    _norm_remote = _normalize_git_remote
 
-                p = _urlparse(url)
-                host = p.hostname or ""
-                path = (p.path or "")
-        except Exception:
-            return None
-        if not host:
-            return None
-        path = path.lstrip("/")
-        if path.endswith(".git"):
-            path = path[:-4]
-        parts = [seg for seg in path.split("/") if seg]
-        if len(parts) < 2:
-            return None
-        owner, repo = parts[0], parts[1]
-        return f"{host}/{owner}/{repo}"
-
-    mode = (settings.project_identity_mode or "dir").strip().lower()
+    # A per-call override (e.g. ensure_project(identity_mode=...)) wins over the
+    # process-wide settings default so callers can opt a single project into a
+    # different identity scheme.
+    mode = ((mode_override or settings.project_identity_mode) or "dir").strip().lower()
     # Mode: git-remote
     if mode == "git-remote":
         try:
@@ -1897,7 +1998,12 @@ def _compute_project_slug(human_key: str) -> str:
                 if gdir:
                     from pathlib import Path as _P
 
-                    gdir_real = str(_P(gdir).resolve())
+                    # rev-parse may return a relative path (e.g. ".git"); anchor it
+                    # to the repo working tree so the slug does not depend on CWD.
+                    gdir_path = _P(gdir)
+                    if not gdir_path.is_absolute():
+                        gdir_path = _P(repo.working_tree_dir or human_key) / gdir_path
+                    gdir_real = str(gdir_path.resolve())
                     base = "repo"
                     return f"{base}-{_short_sha1(gdir_real)}"
         except (InvalidGitRepositoryError, NoSuchPathError, Exception):
@@ -1962,7 +2068,12 @@ def _delete_project_archive_tree(storage_root: str, project_slug: str) -> tuple[
     return _delete_tree_with_counts(project_dir)
 
 
-def _resolve_project_identity(human_key: str) -> dict[str, Any]:
+_VALID_IDENTITY_MODES = ("dir", "git-remote", "git-common-dir", "git-toplevel")
+
+
+def _resolve_project_identity(
+    human_key: str, identity_mode: Optional[str] = None
+) -> dict[str, Any]:
     """
     Resolve identity details for a given human_key path.
     Returns: { slug, identity_mode_used, canonical_path, human_key,
@@ -1970,9 +2081,18 @@ def _resolve_project_identity(human_key: str) -> dict[str, Any]:
                core_ignorecase, normalized_remote, project_uid }
     Writes a private marker under .git/agent-mail/project-id when WORKTREES_ENABLED=1
     and no marker exists yet.
+
+    `identity_mode`, when provided, overrides the process-wide
+    ``project_identity_mode`` setting for this single resolution (one of
+    ``dir``, ``git-remote``, ``git-common-dir``, ``git-toplevel``).
     """
     settings_local = get_settings()
-    mode_config = (settings_local.project_identity_mode or "dir").strip().lower()
+    mode_override = (identity_mode or "").strip().lower() or None
+    if mode_override is not None and mode_override not in _VALID_IDENTITY_MODES:
+        raise ValueError(
+            f"identity_mode must be one of {_VALID_IDENTITY_MODES}, got: '{identity_mode}'."
+        )
+    mode_config = (mode_override or settings_local.project_identity_mode or "dir").strip().lower()
     mode_used = "dir" if not settings_local.worktrees_enabled else mode_config
     target_path = _canonicalize_project_identifier(human_key)
 
@@ -2008,47 +2128,8 @@ def _resolve_project_identity(human_key: str) -> dict[str, Any]:
     normalized_remote: Optional[str] = None
     canonical_path: str = target_path
 
-    def _norm_remote(url: Optional[str]) -> Optional[str]:
-        if not url:
-            return None
-        u = url.strip()
-        try:
-            host = ""
-            path = ""
-            # SCP-like: git@host:owner/repo.git
-            if "@" in u and ":" in u and not u.startswith(("http://", "https://", "ssh://", "git://")):
-                at_pos = u.find("@")
-                colon_pos = u.find(":", at_pos + 1)
-                if colon_pos != -1:
-                    host = u[at_pos + 1 : colon_pos]
-                    path = u[colon_pos + 1 :]
-            else:
-                from urllib.parse import urlparse as _urlparse
-                pr = _urlparse(u)
-                host = (pr.hostname or "").lower()
-                # Some ssh URLs include port; ignore
-                path = (pr.path or "")
-            host = host.lower()
-            if not host:
-                return None
-            path = path.lstrip("/")
-            if path.endswith(".git"):
-                path = path[:-4]
-            # collapse duplicate slashes
-            while "//" in path:
-                path = path.replace("//", "/")
-            parts = [seg for seg in path.split("/") if seg]
-            if len(parts) < 2:
-                return None
-            # Keep the last two segments (owner/repo) and normalize to lowercase
-            # This supports nested group paths (e.g., GitLab subgroups)
-            if len(parts) >= 2:
-                owner, repo_name = parts[-2].lower(), parts[-1].lower()
-            else:
-                return None
-            return f"{host}/{owner}/{repo_name}"
-        except Exception:
-            return None
+    # Delegate to the single shared normalizer so slug/uid can never diverge.
+    _norm_remote = _normalize_git_remote
 
     # Discovery YAML: optional override
     def _read_discovery_yaml(base_dir: str) -> dict[str, Any]:
@@ -2129,12 +2210,27 @@ def _resolve_project_identity(human_key: str) -> dict[str, Any]:
     except (InvalidGitRepositoryError, NoSuchPathError, Exception):
         pass  # Non-git directory; continue with fallback values
 
+    # Resolve git_common_dir to an absolute path. `git rev-parse --git-common-dir`
+    # often returns a RELATIVE path (e.g. ".git") which, if resolved against the
+    # process CWD, makes the project identity depend on the caller's CWD. Anchor
+    # it to repo_root (mirrors the marker_private normalization below) so the UID
+    # is stable regardless of CWD.
+    git_common_dir_abs: Optional[str] = None
+    if git_common_dir:
+        try:
+            gcd_path = Path(git_common_dir)
+            if not gcd_path.is_absolute():
+                gcd_path = Path(repo_root or target_path) / gcd_path
+            git_common_dir_abs = str(gcd_path.resolve())
+        except Exception:
+            git_common_dir_abs = None
+
     if mode_used == "git-remote" and normalized_remote:
         canonical_path = normalized_remote
     elif mode_used == "git-toplevel" and repo_root:
         canonical_path = repo_root
-    elif mode_used == "git-common-dir" and git_common_dir:
-        canonical_path = str(Path(git_common_dir).resolve())
+    elif mode_used == "git-common-dir" and git_common_dir_abs:
+        canonical_path = git_common_dir_abs
     else:
         canonical_path = target_path
 
@@ -2178,9 +2274,9 @@ def _resolve_project_identity(human_key: str) -> dict[str, Any]:
             remote_uid = None
         if remote_uid:
             project_uid = remote_uid
-    if not project_uid and git_common_dir:
+    if not project_uid and git_common_dir_abs:
         try:
-            project_uid = hashlib.sha1(str(Path(git_common_dir).resolve()).encode("utf-8")).hexdigest()[:20]
+            project_uid = hashlib.sha1(git_common_dir_abs.encode("utf-8")).hexdigest()[:20]
         except Exception:
             project_uid = None
     if not project_uid:
@@ -2197,7 +2293,7 @@ def _resolve_project_identity(human_key: str) -> dict[str, Any]:
         except Exception:
             pass
 
-    slug_value = _compute_project_slug(target_path)
+    slug_value = _compute_project_slug(target_path, mode_override=mode_override)
     payload = {
         "slug": slug_value,
         "identity_mode_used": mode_used,
@@ -4252,6 +4348,9 @@ async def _list_inbox(
 ) -> list[dict[str, Any]]:
     if project.id is None or agent.id is None:
         raise ValueError("Project and agent must have ids before listing inbox.")
+    # Defense in depth (issue #178): never pass an out-of-bounds limit to the
+    # DB query, regardless of which caller (tool or resource) supplied it.
+    limit = _validate_limit(limit)
     sender_alias = aliased(Agent)
     sender_project_alias = aliased(Project)
     await ensure_schema()
@@ -4319,6 +4418,8 @@ async def _list_outbox(
     """List messages sent by the agent (their outbox)."""
     if project.id is None or agent.id is None:
         raise ValueError("Project and agent must have ids before listing outbox.")
+    # Defense in depth (issue #178): bound the limit before the DB query.
+    limit = _validate_limit(limit)
     await ensure_schema()
     messages: list[dict[str, Any]] = []
     async with get_session() as session:
@@ -4776,27 +4877,40 @@ async def _update_recipient_timestamp(
         raise ValueError("Agent must have an id before updating message state.")
     now = datetime.now(timezone.utc)
     naive_now = _naive_utc(now)  # Use naive UTC for SQLite compatibility
+    field_col = getattr(MessageRecipient, field)
     async with get_session() as session:
-        # Read current value first
-        result_sel = await session.execute(
-            select(MessageRecipient).where(cast(Any, MessageRecipient.message_id == message_id), cast(Any, MessageRecipient.agent_id == agent.id))
-        )
-        rec = result_sel.scalars().first()
-        if not rec:
-            return None
-        current: Optional[datetime] = getattr(rec, field, None)
-        if current is not None:
-            # Already set; return existing value without updating
-            return current
-        # Set only if null
+        # Single atomic conditional update (issue #187): guard on the column
+        # being NULL so concurrent mark-read/ack calls cannot both win the
+        # race. RETURNING tells us whether *this* statement applied.
         stmt = (
             update(MessageRecipient)
-            .where(MessageRecipient.message_id == message_id, MessageRecipient.agent_id == agent.id)
+            .where(
+                MessageRecipient.message_id == message_id,
+                MessageRecipient.agent_id == agent.id,
+                cast(Any, field_col).is_(None),
+            )
             .values({field: naive_now})
+            .returning(cast(Any, field_col))
         )
-        await session.execute(stmt)
+        result = await session.execute(stmt)
+        applied = result.first()
         await session.commit()
-    return naive_now
+        if applied is not None:
+            # We won the race and set the timestamp.
+            return naive_now
+        # No row updated: either the recipient row is absent, or the field was
+        # already set by a prior (possibly concurrent) call. Re-read to tell
+        # those apart and return the existing value idempotently.
+        result_sel = await session.execute(
+            select(field_col).where(
+                cast(Any, MessageRecipient.message_id == message_id),
+                cast(Any, MessageRecipient.agent_id == agent.id),
+            )
+        )
+        existing = result_sel.first()
+        if existing is None:
+            return None
+        return existing[0]
 
 
 def build_mcp_server() -> FastMCP:
@@ -5183,8 +5297,14 @@ def build_mcp_server() -> FastMCP:
             return ordered
 
         to_names = _unique(to_names)
-        cc_names = _unique(cc_names)
-        bcc_names = _unique(bcc_names)
+        # Cross-list dedup with precedence to > cc > bcc (issue #190): the same
+        # agent appearing in multiple lists would otherwise produce duplicate
+        # MessageRecipient rows that collide on the (message_id, agent_id)
+        # primary key. Keep each recipient in their highest-priority list only.
+        _claimed: set[str] = set(to_names)
+        cc_names = [name for name in _unique(cc_names) if name not in _claimed]
+        _claimed.update(cc_names)
+        bcc_names = [name for name in _unique(bcc_names) if name not in _claimed]
         combined_names = [*to_names, *cc_names, *bcc_names]
         agent_map = await _get_agents_batch(project, combined_names)
         to_agents = [agent_map[name] for name in to_names]
@@ -5279,7 +5399,10 @@ def build_mcp_server() -> FastMCP:
                         normalized_surfaces = [_normalize_pathspec_pattern(s) for s in candidate_surfaces]
                         matching_normalized = set(union_spec.match_files(normalized_surfaces))
                         for orig_surface, norm_surface in zip(candidate_surfaces, normalized_surfaces, strict=True):
-                            if norm_surface in matching_normalized:
+                            # `match_files` cannot catch reverse-glob conflicts (a candidate glob
+                            # enclosing an existing literal), so always defer globbed candidate
+                            # surfaces to the symmetric detailed check below. (#193)
+                            if norm_surface in matching_normalized or _contains_glob(norm_surface):
                                 potentially_conflicting_surfaces.add(orig_surface)
                     else:
                         potentially_conflicting_surfaces = set(candidate_surfaces)
@@ -5569,7 +5692,9 @@ def build_mcp_server() -> FastMCP:
 
         How it works
         ------------
-        - Validates that `human_key` is an absolute directory path (the agent's working directory).
+        - Validates that `human_key` is an absolute path-like project key (typically the
+          agent's working directory). It need not exist on the local filesystem: it is an
+          opaque project KEY, and collaborating agents may not share a filesystem.
         - Computes a stable slug from `human_key` (lowercased, safe characters) so
           multiple agents can refer to the same project consistently.
         - Ensures DB row exists and that the on-disk archive is initialized
@@ -5577,7 +5702,8 @@ def build_mcp_server() -> FastMCP:
 
         CRITICAL: Project Identity Rules
         ---------------------------------
-        - The `human_key` MUST be the absolute path to the agent's working directory
+        - The `human_key` MUST be an absolute path-like project key (typically the
+          agent's working directory path)
         - Two agents working in the SAME directory path are working on the SAME project
         - Example: Both agents in /data/projects/smartedgar_mcp → SAME project
         - Sibling projects are DIFFERENT directories (e.g., /data/projects/smartedgar_mcp
@@ -5586,10 +5712,16 @@ def build_mcp_server() -> FastMCP:
         Parameters
         ----------
         human_key : str
-            The absolute path to the agent's working directory (e.g., "/data/projects/backend").
-            This MUST be an absolute path, not a relative path or arbitrary slug.
-            This is the canonical identifier for the project - all agents working in this
-            directory will share the same project identity.
+            An absolute path-like project key (e.g., "/data/projects/backend"), typically the
+            agent's working directory. This MUST be an absolute path, not a relative path or
+            arbitrary slug, but it does NOT need to exist on the local filesystem - it is an
+            opaque project KEY (collaborating agents may not share a filesystem).
+            This is the canonical identifier for the project - all agents using the same key
+            share the same project identity.
+        identity_mode : str, optional
+            Per-call override of the server's PROJECT_IDENTITY_MODE setting; one of
+            "dir", "git-remote", "git-common-dir", "git-toplevel". Only takes effect when
+            worktree-friendly identity is enabled (WORKTREES_ENABLED=1).
 
         Returns
         -------
@@ -5619,10 +5751,11 @@ def build_mcp_server() -> FastMCP:
         - Safe to call multiple times. If the project already exists, the existing
           record is returned and the archive is ensured on disk (no destructive changes).
         """
-        # Validate that human_key is an absolute path (cross-platform)
+        # Validate that human_key is an absolute path-like project key (cross-platform).
+        # It need not exist on disk - it is an opaque project KEY, not a filesystem probe.
         if not Path(human_key).is_absolute():
             raise ValueError(
-                f"human_key must be an absolute directory path, got: '{human_key}'. "
+                f"human_key must be an absolute path-like project key, got: '{human_key}'. "
                 "Use the agent's working directory path (e.g., '/data/projects/backend' on Unix "
                 "or 'C:\\projects\\backend' on Windows)."
             )
@@ -5633,7 +5766,7 @@ def build_mcp_server() -> FastMCP:
         payload = _project_to_dict(project)
         # Worktree identity metadata is opt-in to keep default calls lightweight and stable.
         if settings.worktrees_enabled:
-            identity_payload = _resolve_project_identity(human_key)
+            identity_payload = _resolve_project_identity(human_key, identity_mode=identity_mode)
             payload["identity"] = identity_payload
             for key in (
                 "identity_mode_used",
@@ -9027,8 +9160,23 @@ def build_mcp_server() -> FastMCP:
             action="set_contact_policy",
         )
         pol = (policy or "auto").lower()
-        if pol not in {"open", "auto", "contacts_only", "block_all"}:
-            pol = "auto"
+        valid_policies = {"open", "auto", "contacts_only", "block_all"}
+        if pol not in valid_policies:
+            # Reject unknown policies rather than silently coercing to "auto"
+            # (issue #201): coercing e.g. "block" -> "auto" weakens protection.
+            await ctx.error(
+                f"INVALID_ARGUMENT: unknown contact policy {policy!r}. "
+                f"Expected one of: {', '.join(sorted(valid_policies))}."
+            )
+            raise ToolExecutionError(
+                error_type="INVALID_ARGUMENT",
+                message=(
+                    f"Unknown contact policy {policy!r}. "
+                    f"Expected one of: {', '.join(sorted(valid_policies))}."
+                ),
+                recoverable=True,
+                data={"argument": "policy", "provided": policy, "valid": sorted(valid_policies)},
+            )
         async with get_session() as s:
             db_agent = await s.get(Agent, agent.id)
             if db_agent:
@@ -9097,17 +9245,11 @@ def build_mcp_server() -> FastMCP:
         }}}
         ```
         """
-        # Validate limit parameter bounds
-        if limit < 1:
-            raise ToolExecutionError(
-                error_type="INVALID_LIMIT",
-                message=f"limit must be at least 1, got {limit}. Use a positive integer.",
-                recoverable=True,
-                data={"provided": limit, "min": 1, "max": 1000},
-            )
-        if limit > 1000:
+        # Validate limit parameter bounds (shared with search_messages, the
+        # product tools, and the resource handlers via _validate_limit).
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 1000:
             await ctx.info(f"[warn] limit={limit} is very large; capping at 1000 to prevent performance issues.")
-            limit = 1000
+        limit = _validate_limit(limit)
 
         # Validate since_ts format upfront with helpful error message
         _validate_iso_timestamp(since_ts, "since_ts")
@@ -9674,18 +9816,31 @@ def build_mcp_server() -> FastMCP:
 
         release_result = None
         if auto_release:
-            release_tool = cast(FunctionTool, cast(Any, release_file_reservations_tool))
-            release_tool_result = await release_tool.run(
-                {
-                    "ctx": ctx,
-                    "project_key": project_key,
-                    "agent_name": agent_name,
-                    "paths": paths,
-                    "registration_token": registration_token,
-                    "format": "json",
-                }
-            )
-            release_result = cast(dict[str, Any], release_tool_result.structured_content or {})
+            # Release ONLY the reservations this macro freshly granted, by id. Releasing
+            # by `paths` (or including reused ids) would tear down reservations the agent
+            # already held before this call. (#196)
+            granted_entries = file_reservations_result.get("granted") or []
+            newly_granted_ids = [
+                entry["id"]
+                for entry in granted_entries
+                if entry.get("id") is not None and not entry.get("reused", False)
+            ]
+            if newly_granted_ids:
+                release_tool = cast(FunctionTool, cast(Any, release_file_reservations_tool))
+                release_tool_result = await release_tool.run(
+                    {
+                        "ctx": ctx,
+                        "project_key": project_key,
+                        "agent_name": agent_name,
+                        "file_reservation_ids": newly_granted_ids,
+                        "registration_token": registration_token,
+                        "format": "json",
+                    }
+                )
+                release_result = cast(dict[str, Any], release_tool_result.structured_content or {})
+            else:
+                # Nothing new to release (all reservations pre-existed); skip the call.
+                release_result = {"released": [], "skipped": "no_newly_granted_reservations"}
 
         await ctx.info(
             f"macro_file_reservation_cycle issued {len(file_reservations_result['granted'])} file_reservation(s) for '{agent_name}' on '{project_key}'" +
@@ -10114,6 +10269,9 @@ def build_mcp_server() -> FastMCP:
         }}}
         ```
         """
+        # Apply the shared limit bounds (issue #191) so search_messages matches
+        # fetch_inbox: reject limit<1, clamp >1000.
+        limit = _validate_limit(limit)
         project = await _get_project_by_identifier(project_key)
         viewer = await _resolve_authenticated_agent(
             ctx,
@@ -11011,7 +11169,12 @@ def build_mcp_server() -> FastMCP:
                     matching_normalized = set(union_spec.match_files(normalized_paths))
                     # Build set of original paths that might conflict
                     for orig_path, norm_path in zip(paths, normalized_paths, strict=True):
-                        if norm_path in matching_normalized:
+                        # `match_files` only treats the candidate as a concrete FILE matched
+                        # against existing patterns, so it cannot detect reverse-glob conflicts
+                        # (a candidate glob like "app/**" enclosing an existing literal like
+                        # "app/models/user.py"). Always defer globbed candidates to the detailed
+                        # _file_reservations_conflict check, which is symmetric. (#193)
+                        if norm_path in matching_normalized or _contains_glob(norm_path):
                             potentially_conflicting_paths.add(orig_path)
                 else:
                     # Fallback: all paths potentially conflict (PathSpec unavailable)
@@ -11047,6 +11210,10 @@ def build_mcp_server() -> FastMCP:
                         # Advisory model: still grant the file_reservation but surface conflicts
                         conflicts.append({"path": path, "holders": conflicting_holders})
                     requested_exp = _naive_utc() + timedelta(seconds=ttl_seconds)
+                    # Track whether this reservation already existed for this agent so
+                    # callers (e.g. macro auto-release) can avoid releasing a reservation
+                    # the agent held before this call. (#196)
+                    reused_existing = existing_self_reservation is not None
                     if existing_self_reservation is not None:
                         current_exp = existing_self_reservation.expires_ts
                         if getattr(current_exp, "tzinfo", None) is not None:
@@ -11085,6 +11252,7 @@ def build_mcp_server() -> FastMCP:
                             "exclusive": file_reservation.exclusive,
                             "reason": file_reservation.reason,
                             "expires_ts": _iso(file_reservation.expires_ts),
+                            "reused": reused_existing,
                         }
                     )
                     existing_reservations.append((file_reservation, agent.name))
@@ -12063,6 +12231,8 @@ def build_mcp_server() -> FastMCP:
             """
             Full-text search across all projects linked to a product.
             """
+            # Shared limit bounds (issue #202): reject limit<1, clamp >1000.
+            limit = _validate_limit(limit)
             # Sanitize the FTS query first
             sanitized_query = _sanitize_fts_query(query)
             if sanitized_query is None:
@@ -12224,6 +12394,8 @@ def build_mcp_server() -> FastMCP:
             has not explicitly marked read; especially load-bearing for product-wide
             polling where the cross-project token cost compounds.
             """
+            # Shared limit bounds (issue #202): reject limit<1, clamp >1000.
+            limit = _validate_limit(limit)
             _product, _projects, authorized = await _authenticate_product_agents(
                 ctx,
                 product_key,
@@ -13529,9 +13701,9 @@ def build_mcp_server() -> FastMCP:
         if "?" in agent:
             name_part, _, qs = agent.partition("?")
             agent = name_part
+            from urllib.parse import parse_qs
+            parsed = parse_qs(qs, keep_blank_values=False)
             try:
-                from urllib.parse import parse_qs
-                parsed = parse_qs(qs, keep_blank_values=False)
                 if project is None and "project" in parsed and parsed["project"]:
                     project = parsed["project"][0]
                 if since_ts is None and "since_ts" in parsed and parsed["since_ts"]:
@@ -13544,13 +13716,16 @@ def build_mcp_server() -> FastMCP:
                 if parsed.get("include_bodies"):
                     val = parsed["include_bodies"][0].strip().lower()
                     include_bodies = val in ("1", "true", "t", "yes", "y")
-                if parsed.get("limit"):
-                    with suppress(Exception):
-                        limit = int(parsed["limit"][0])
                 format_value = format_value or _extract_format_param(parsed)
             except Exception:
                 pass
+            # Parse/validate limit OUTSIDE the suppressing block so an invalid
+            # value raises (issue #178) instead of being silently ignored and
+            # falling through to an unbounded DB query.
+            limit = _parse_resource_limit(parsed, default=limit)
 
+        # Guard the limit even when no query string was embedded in the path.
+        limit = _validate_limit(limit)
         project_obj = await _get_project_by_identifier(
             _require_project_resource_param(project, resource_name="inbox resource")
         )
