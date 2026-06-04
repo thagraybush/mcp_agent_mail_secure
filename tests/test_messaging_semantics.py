@@ -1203,3 +1203,49 @@ async def test_search_and_summarize_thread_respect_recipient_visibility(isolated
         )
         assert summary_result.data["summary"]["total_messages"] == 0
         assert summary_result.data["examples"] == []
+
+
+@pytest.mark.asyncio
+async def test_send_message_rolls_back_db_row_when_archive_write_fails(isolated_env, monkeypatch):
+    """#180: a failed archive write after the message row is committed must roll
+    the row (and its recipients) back, not orphan a committed DB row."""
+    import mcp_agent_mail.app as app_module
+    from sqlalchemy import func
+    from sqlalchemy import select as sa_select
+
+    from mcp_agent_mail.models import Message, MessageRecipient
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool(
+            "register_agent",
+            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+        )
+
+        async def _boom(*_args, **_kwargs):
+            raise RuntimeError("simulated archive write failure")
+
+        monkeypatch.setattr(app_module, "write_message_bundle", _boom)
+
+        with pytest.raises(ToolError):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "Backend",
+                    "sender_name": "BlueLake",
+                    "to": ["BlueLake"],
+                    "subject": "Plan",
+                    "body_md": "body",
+                },
+            )
+
+        async with get_session() as session:
+            msg_count = (
+                await session.execute(sa_select(func.count()).select_from(Message))
+            ).scalar_one()
+            rec_count = (
+                await session.execute(sa_select(func.count()).select_from(MessageRecipient))
+            ).scalar_one()
+        assert msg_count == 0, "orphaned Message row left after archive write failure (#180)"
+        assert rec_count == 0, "orphaned MessageRecipient rows left after archive failure (#180)"

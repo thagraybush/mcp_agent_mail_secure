@@ -5488,15 +5488,38 @@ def build_mcp_server() -> FastMCP:
             if window_identity is not None:
                 payload["window_id"] = window_identity.window_uuid
                 payload["window_display_name"] = window_identity.display_name
-            await write_message_bundle(
-                archive,
-                frontmatter,
-                processed_body,
-                sender_archive_label,
-                recipients_for_archive,
-                attachment_files,
-                sender_outbox_name=sender.name if sender_is_local else None,
-            )
+            try:
+                await write_message_bundle(
+                    archive,
+                    frontmatter,
+                    processed_body,
+                    sender_archive_label,
+                    recipients_for_archive,
+                    attachment_files,
+                    sender_outbox_name=sender.name if sender_is_local else None,
+                )
+            except Exception:
+                # #180: _create_message already committed the message + recipient
+                # rows. If the archive write fails, roll them back so we never
+                # leave a committed DB row with no archive artifact (mirrors the
+                # #173 agent-registration compensation). Best-effort cleanup; the
+                # original archive error is always re-raised.
+                with suppress(Exception):
+                    async with get_session() as rollback_session:
+                        orphan_recipients = (
+                            await rollback_session.execute(
+                                select(MessageRecipient).where(
+                                    MessageRecipient.message_id == message.id
+                                )
+                            )
+                        ).scalars().all()
+                        for orphan_recipient in orphan_recipients:
+                            await rollback_session.delete(orphan_recipient)
+                        orphan_message = await rollback_session.get(Message, message.id)
+                        if orphan_message is not None:
+                            await rollback_session.delete(orphan_message)
+                        await rollback_session.commit()
+                raise
 
             # Collect notification signals for post-lock emission.
             if settings.notifications.enabled:
