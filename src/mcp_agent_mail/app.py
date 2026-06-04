@@ -1780,6 +1780,9 @@ def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, A
         "project_id": message.project_id,
         "sender_id": message.sender_id,
         "thread_id": message.thread_id,
+        # #188: surface the persisted parent→child reply edge so the response
+        # reflects STORED data, not a value reconstructed only in the response.
+        "reply_to": message.reply_to,
         "topic": message.topic,
         "subject": message.subject,
         "importance": message.importance,
@@ -1864,6 +1867,10 @@ def _message_frontmatter(
         "created": _iso(message.created_ts),
         "attachments": attachments,
     }
+    # #188: persist the direct reply edge in the Git archive frontmatter too,
+    # but only for actual replies so top-level messages stay clean.
+    if message.reply_to is not None:
+        data["reply_to"] = message.reply_to
     _apply_sender_identity(
         data,
         message_project_id=project.id,
@@ -3727,6 +3734,7 @@ async def _create_message(
     thread_id: Optional[str],
     attachments: Sequence[dict[str, Any]],
     topic: Optional[str] = None,
+    reply_to: Optional[int] = None,
 ) -> Message:
     if project.id is None:
         raise ValueError("Project must have an id before creating messages.")
@@ -3743,6 +3751,7 @@ async def _create_message(
             ack_required=ack_required,
             thread_id=thread_id,
             topic=topic,
+            reply_to=reply_to,
             attachments=list(attachments),
         )
         session.add(message)
@@ -5287,6 +5296,7 @@ def build_mcp_server() -> FastMCP:
         ack_required: bool,
         thread_id: Optional[str],
         topic: Optional[str] = None,
+        reply_to: Optional[int] = None,
     ) -> dict[str, Any]:
         # Re-fetch settings at call time so tests that mutate env + clear cache take effect
         settings = get_settings()
@@ -5455,6 +5465,7 @@ def build_mcp_server() -> FastMCP:
                 thread_id,
                 attachments_meta,
                 topic=topic,
+                reply_to=reply_to,
             )
             frontmatter = _message_frontmatter(
                 message,
@@ -7162,6 +7173,26 @@ def build_mcp_server() -> FastMCP:
                 data={"argument": "bcc"},
             )
 
+        # Reject empty-recipient sends for non-broadcast messages.
+        #
+        # Without this guard a non-broadcast send with empty to/cc/bcc falls
+        # through every downstream step and returns ``count: 0`` while
+        # reporting success — silently dropping the message and contradicting
+        # the docstring ("If no recipients are given, the call fails."). The
+        # broadcast path is intentionally exempt: ``broadcast=true`` with no
+        # eligible recipients is a legitimately-empty result (sender is the
+        # only active agent) and is already surfaced via ctx.info above. (#189)
+        if not broadcast and not any(
+            (r or "").strip() for r in ((to or []) + (cc or []) + (bcc or []))
+        ):
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "send_message requires at least one recipient in to/cc/bcc "
+                "(or broadcast=true).",
+                recoverable=True,
+                data={"argument": "to"},
+            )
+
         # Self-send detection: warn if sender is sending to themselves
         sender_lower = sender_name.lower().strip()
         all_recipients = (to or []) + (cc or []) + (bcc or [])
@@ -8685,6 +8716,7 @@ def build_mcp_server() -> FastMCP:
                 ack_required=original.ack_required,
                 thread_id=thread_key,
                 topic=original.topic,
+                reply_to=original.id,
             )
             _collect_delivery_result(deliveries, delivery_errors, project, payload_local)
 
@@ -8707,6 +8739,7 @@ def build_mcp_server() -> FastMCP:
                     ack_required=original.ack_required,
                     thread_id=thread_key,
                     topic=original.topic,
+                    reply_to=original.id,
                 )
                 _collect_delivery_result(deliveries, delivery_errors, target_project, payload_ext)
             except Exception as exc:
@@ -11185,6 +11218,12 @@ def build_mcp_server() -> FastMCP:
                 existing_reservations = [(row[0], row[1]) for row in existing_rows.all()]
 
                 payloads: list[dict[str, Any]] = []
+                # #180: track reservations newly *created* by this call (not the
+                # ones that merely had their expiry extended). If the Git
+                # archive write below fails after the DB commit, we delete these
+                # so we never leave a committed reservation row with no archive
+                # artifact — mirroring the message-creation compensation.
+                created_reservations: list[FileReservation] = []
                 # Build union PathSpec for fast conflict pre-filtering (O(n+m) instead of O(n*m))
                 union_spec = _build_reservation_union_spec(existing_reservations, agent.id, exclusive)
 
@@ -11265,6 +11304,7 @@ def build_mcp_server() -> FastMCP:
                         )
                         session.add(file_reservation)
                         await session.flush()  # Assigns id without committing
+                        created_reservations.append(file_reservation)
                     file_reservation_payload = _file_reservation_payload(
                         project,
                         file_reservation,
@@ -11287,7 +11327,27 @@ def build_mcp_server() -> FastMCP:
                 # Commit all reservations atomically within the IMMEDIATE tx
                 await session.commit()
             if payloads:
-                await write_file_reservation_records(archive, payloads)
+                try:
+                    await write_file_reservation_records(archive, payloads)
+                except Exception:
+                    # #180: the reservation rows are already committed. If the
+                    # Git archive write fails, delete the rows this call newly
+                    # created so we don't leave committed reservations with no
+                    # archive artifact (reused/extended reservations are left
+                    # as-is — they legitimately existed before this call).
+                    # Best-effort cleanup; the original archive error always
+                    # re-raises.
+                    created_ids = [r.id for r in created_reservations if r.id is not None]
+                    if created_ids:
+                        with suppress(Exception):
+                            async with get_immediate_session() as rollback_session:
+                                await rollback_session.execute(
+                                    delete(FileReservation).where(
+                                        cast(Any, FileReservation.id).in_(created_ids)
+                                    )
+                                )
+                                await rollback_session.commit()
+                    raise
         await ctx.info(f"Issued {len(granted)} file_reservations for '{agent.name}'. Conflicts: {len(conflicts)}")
         # Surface per-call enforcement mode so wrappers (e.g. ntm's `lock`
         # subcommand) can warn the operator that code-repo paths are

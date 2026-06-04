@@ -1146,3 +1146,48 @@ async def test_ttl_minimum_enforced(isolated_env):
             # Expected error for TTL too short
             error_str = str(e).lower()
             assert "ttl" in error_str or "60" in error_str or "minimum" in error_str
+
+
+@pytest.mark.asyncio
+async def test_file_reservation_rolls_back_db_row_when_archive_write_fails(isolated_env, monkeypatch):
+    """#180: file_reservation_paths commits reservation rows before writing the
+    Git archive. A failed archive write must delete the just-created rows so we
+    never leave a committed reservation with no archive artifact — mirroring the
+    message-creation compensation."""
+    from fastmcp.exceptions import ToolError
+
+    import mcp_agent_mail.app as app_module
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project_key, agent_name = await setup_project_and_agent(client, "/test/res/archive-fail")
+
+        async def _boom(*_args, **_kwargs):
+            raise RuntimeError("simulated reservation archive write failure")
+
+        monkeypatch.setattr(app_module, "write_file_reservation_records", _boom)
+
+        with pytest.raises(ToolError):
+            await client.call_tool(
+                "file_reservation_paths",
+                {
+                    "project_key": project_key,
+                    "agent_name": agent_name,
+                    "paths": ["src/**"],
+                    "ttl_seconds": 3600,
+                    "exclusive": True,
+                    "reason": "should be rolled back on archive failure",
+                },
+            )
+
+        project_id = await get_project_id(project_key)
+        assert project_id is not None
+        # No reservation row should survive the archive-write failure.
+        async with get_session() as session:
+            count = (
+                await session.execute(
+                    text("SELECT COUNT(*) FROM file_reservations WHERE project_id = :pid"),
+                    {"pid": project_id},
+                )
+            ).scalar() or 0
+        assert count == 0, "orphaned file_reservation row left after archive write failure (#180)"

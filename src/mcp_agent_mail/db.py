@@ -932,6 +932,10 @@ def _setup_fts(connection: Any) -> None:
         "ALTER TABLE projects ADD COLUMN archived_at DATETIME DEFAULT NULL",
         "ALTER TABLE agents ADD COLUMN registration_token VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE messages ADD COLUMN topic VARCHAR(64) DEFAULT NULL",
+        # #188: persist the direct parent→child reply edge so replies survive a
+        # round-trip through the DB (previously reply_to lived only in the
+        # response payload and was lost on read).
+        "ALTER TABLE messages ADD COLUMN reply_to INTEGER DEFAULT NULL",
     ]:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)
@@ -941,6 +945,7 @@ def _setup_fts(connection: Any) -> None:
     for index_sql in [
         "CREATE INDEX IF NOT EXISTS ix_agents_registration_token ON agents (registration_token)",
         "CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages (project_id, topic)",
+        "CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages (reply_to)",
     ]:
         connection.exec_driver_sql(index_sql)
 

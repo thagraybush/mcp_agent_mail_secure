@@ -1457,7 +1457,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 try:
                     response = await call_next(request)
                     return response
-                except BaseException as err:  # noqa: BLE001 - log then re-raise
+                except BaseException as err:
                     exc = err
                     raise
                 finally:
@@ -2776,7 +2776,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 m.created_ts,
                                 m.importance,
                                 m.thread_id,
-                                m.ack_required
+                                m.ack_required,
+                                m.attachments
                             FROM messages m
                             JOIN agents s ON s.id = m.sender_id
                             LEFT JOIN projects sp ON sp.id = s.project_id
@@ -2880,6 +2881,23 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 sender_project_human_key=mrow["sender_project_name"],
                 sender_project_slug=mrow["sender_project_slug"],
             )
+            # Parse persisted attachments so the message view can render/link
+            # them (#220). Stored as a JSON array column.
+            message_attachments: list[dict[str, Any]] = []
+            try:
+                raw_attachments = mrow["attachments"]
+                if isinstance(raw_attachments, str):
+                    try:
+                        parsed_attachments = json.loads(raw_attachments)
+                    except json.JSONDecodeError:
+                        parsed_attachments = []
+                else:
+                    parsed_attachments = raw_attachments
+                if isinstance(parsed_attachments, list):
+                    message_attachments = [a for a in parsed_attachments if isinstance(a, dict)]
+            except Exception:
+                message_attachments = []
+
             message_payload = {
                 "id": mrow["id"],
                 "subject": mrow["subject"],
@@ -2889,6 +2907,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 "created": str(mrow["created_ts"]),
                 "importance": mrow["importance"],
                 "thread_id": mrow["thread_id"],
+                "attachments": message_attachments,
             }
             message_payload.update(sender_meta)
 

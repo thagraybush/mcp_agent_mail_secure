@@ -98,6 +98,10 @@ class Message(SQLModel, table=True):
     project_id: int = Field(foreign_key="projects.id", index=True)
     sender_id: int = Field(foreign_key="agents.id", index=True)
     thread_id: Optional[str] = Field(default=None, index=True, max_length=128)
+    # Direct parent→child reply edge (the specific message this one replies to),
+    # distinct from `thread_id` which groups a whole conversation. Nullable: a
+    # top-level message replies to nothing. (#188)
+    reply_to: Optional[int] = Field(default=None, foreign_key="messages.id", index=True)
     topic: Optional[str] = Field(default=None, max_length=64)
     subject: str = Field(max_length=512)
     body_md: str

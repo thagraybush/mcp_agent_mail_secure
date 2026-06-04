@@ -216,7 +216,13 @@ async def test_placeholder_detection_your_agent_name(isolated_env):
 
 @pytest.mark.asyncio
 async def test_send_message_empty_recipients(isolated_env):
-    """send_message with empty to/cc/bcc returns 0 deliveries (no error)."""
+    """send_message with empty to/cc/bcc (non-broadcast) must fail, not succeed with count:0.
+
+    Regression for #189: previously an all-empty recipient set fell through
+    and returned ``count: 0`` while reporting success, silently dropping the
+    message and contradicting the docstring ("If no recipients are given, the
+    call fails."). It must now raise INVALID_ARGUMENT.
+    """
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": "/emptyrecip"})
@@ -226,20 +232,19 @@ async def test_send_message_empty_recipients(isolated_env):
         )
         sender_name = agent_result.data["name"]
 
-        # API allows empty recipients - returns 0 deliveries
-        result = await client.call_tool(
-            "send_message",
-            {
-                "project_key": "EmptyRecip",
-                "sender_name": sender_name,
-                "to": [],
-                "subject": "Test",
-                "body_md": "Body",
-            },
-        )
-        # Should succeed but with no deliveries
-        assert result.data["count"] == 0
-        assert result.data["deliveries"] == []
+        # Non-broadcast send with no recipients must be rejected.
+        with pytest.raises(ToolError) as exc_info:
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "EmptyRecip",
+                    "sender_name": sender_name,
+                    "to": [],
+                    "subject": "Test",
+                    "body_md": "Body",
+                },
+            )
+        assert "recipient" in str(exc_info.value).lower()
 
 
 @pytest.mark.asyncio
