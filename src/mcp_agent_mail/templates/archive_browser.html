@@ -121,7 +121,14 @@ function browserManager() {
 
           if (isMarkdown) {
             try {
-              container.innerHTML = typeof marked !== 'undefined' ? marked.parse(content) : this.escapeHtml(content);
+              // Sanitize rendered Markdown to prevent stored XSS from archive
+              // content (#217); fall back to escaped text if marked/DOMPurify
+              // are unavailable.
+              if (typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined') {
+                container.innerHTML = DOMPurify.sanitize(marked.parse(content));
+              } else {
+                container.innerHTML = this.escapeHtml(content);
+              }
             } catch (error) {
               console.error('Markdown rendering failed:', error);
               container.innerHTML = `<pre class="whitespace-pre-wrap break-words text-sm font-mono">${this.escapeHtml(content)}</pre>`;

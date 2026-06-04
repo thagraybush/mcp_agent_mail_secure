@@ -1158,7 +1158,15 @@ function unifiedInboxManager() {
                 mangle: false
               });
 
-              bodyEl.innerHTML = marked.parse(msg.body_md);
+              // Sanitize agent-supplied Markdown before injecting as HTML to
+              // prevent stored XSS (#216). Fall back to plain text if DOMPurify
+              // is unavailable rather than rendering unsanitized HTML.
+              if (typeof DOMPurify !== 'undefined') {
+                bodyEl.innerHTML = DOMPurify.sanitize(marked.parse(msg.body_md));
+              } else {
+                console.warn('DOMPurify not loaded - rendering message body as plain text');
+                bodyEl.textContent = msg.body_md;
+              }
             } catch (error) {
               // Fallback to plain text if parsing fails
               console.error('Markdown parsing failed:', error);

@@ -179,7 +179,15 @@
                 headerIds: true,
                 mangle: false
               });
-              bodyEl.innerHTML = marked.parse(markdownContent);
+              // Sanitize agent-supplied Markdown before injecting as HTML to
+              // prevent stored XSS (#216). Fall back to plain text if DOMPurify
+              // is unavailable rather than rendering unsanitized HTML.
+              if (typeof DOMPurify !== 'undefined') {
+                bodyEl.innerHTML = DOMPurify.sanitize(marked.parse(markdownContent));
+              } else {
+                console.warn('DOMPurify not loaded - rendering message body as plain text');
+                bodyEl.textContent = markdownContent;
+              }
             } catch (error) {
               console.error('Markdown parsing failed:', error);
               bodyEl.textContent = markdownContent;
