@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from mcp_agent_mail.config import clear_settings_cache, get_settings
+from mcp_agent_mail.config import ConfigError, clear_settings_cache, get_settings
 from mcp_agent_mail.db import (
     UnsupportedDatabaseBackendError,
     _assert_supported_backend,
@@ -32,6 +32,92 @@ def test_config_csv_and_bool_parsing(monkeypatch):
     s = get_settings()
     assert {"reader", "ro", "read"}.issubset(set(s.http.rbac_reader_roles))
     assert s.http.rate_limit_enabled is True
+
+
+# ============================================================================
+# #169: configuration parsers must fail-closed on malformed *explicit* values
+# while still falling back to defaults for empty/unset values.
+# ============================================================================
+
+
+def test_config_valid_explicit_values_parse(monkeypatch):
+    """Valid explicit values must parse to their typed forms."""
+    monkeypatch.setenv("HTTP_PORT", "9999")
+    monkeypatch.setenv("HTTP_RATE_LIMIT_ENABLED", "yes")
+    monkeypatch.setenv("LLM_TEMPERATURE", "0.7")
+    monkeypatch.setenv("AGENT_NAME_ENFORCEMENT_MODE", "strict")
+    monkeypatch.setenv("HTTP_RATE_LIMIT_BACKEND", "redis")
+    clear_settings_cache()
+    s = get_settings()
+    assert s.http.port == 9999
+    assert s.http.rate_limit_enabled is True
+    assert s.llm.temperature == pytest.approx(0.7)
+    assert s.agent_name_enforcement_mode == "strict"
+    assert s.http.rate_limit_backend == "redis"
+
+
+def test_config_empty_value_falls_back_to_default(monkeypatch):
+    """An explicitly-empty value is legitimate and must use the default, not raise."""
+    monkeypatch.setenv("HTTP_PORT", "")
+    monkeypatch.setenv("HTTP_RATE_LIMIT_ENABLED", "")
+    monkeypatch.setenv("DATABASE_POOL_SIZE", "")
+    monkeypatch.setenv("AGENT_NAME_ENFORCEMENT_MODE", "")
+    clear_settings_cache()
+    s = get_settings()
+    assert s.http.port == 8765
+    assert s.http.rate_limit_enabled is False
+    assert s.database.pool_size == 50  # empty -> the configured default (50)
+    assert s.agent_name_enforcement_mode == "coerce"  # default
+
+
+def test_config_malformed_int_raises_with_key(monkeypatch):
+    monkeypatch.setenv("HTTP_PORT", "not-a-number")
+    clear_settings_cache()
+    with pytest.raises(ConfigError) as exc:
+        get_settings()
+    assert "HTTP_PORT" in str(exc.value)
+
+
+def test_config_malformed_bool_raises_with_key(monkeypatch):
+    monkeypatch.setenv("HTTP_RATE_LIMIT_ENABLED", "maybe")
+    clear_settings_cache()
+    with pytest.raises(ConfigError) as exc:
+        get_settings()
+    assert "HTTP_RATE_LIMIT_ENABLED" in str(exc.value)
+
+
+def test_config_malformed_float_raises_with_key(monkeypatch):
+    monkeypatch.setenv("LLM_TEMPERATURE", "hot")
+    clear_settings_cache()
+    with pytest.raises(ConfigError) as exc:
+        get_settings()
+    assert "LLM_TEMPERATURE" in str(exc.value)
+
+
+def test_config_unknown_enum_raises_with_key_and_allowed(monkeypatch):
+    monkeypatch.setenv("AGENT_NAME_ENFORCEMENT_MODE", "bogus")
+    clear_settings_cache()
+    with pytest.raises(ConfigError) as exc:
+        get_settings()
+    msg = str(exc.value)
+    assert "AGENT_NAME_ENFORCEMENT_MODE" in msg
+    assert "strict" in msg  # surfaces the allowed values
+
+
+def test_config_unknown_rate_limit_backend_raises(monkeypatch):
+    monkeypatch.setenv("HTTP_RATE_LIMIT_BACKEND", "cassandra")
+    clear_settings_cache()
+    with pytest.raises(ConfigError) as exc:
+        get_settings()
+    assert "HTTP_RATE_LIMIT_BACKEND" in str(exc.value)
+
+
+def test_config_malformed_optional_int_raises_with_key(monkeypatch):
+    monkeypatch.setenv("DATABASE_POOL_SIZE", "lots")
+    clear_settings_cache()
+    with pytest.raises(ConfigError) as exc:
+        get_settings()
+    assert "DATABASE_POOL_SIZE" in str(exc.value)
 
 
 def test_database_pool_size_default_is_50(monkeypatch):

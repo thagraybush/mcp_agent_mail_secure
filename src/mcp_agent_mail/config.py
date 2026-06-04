@@ -288,30 +288,74 @@ class Settings:
     auto_retire_stale_agents_threshold_seconds: int
 
 
-def _bool(value: str, *, default: bool) -> bool:
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "t", "yes", "y"}:
-        return True
-    if normalized in {"0", "false", "f", "no", "n"}:
-        return False
-    return default
+class ConfigError(ValueError):
+    """Raised when an explicit configuration value is malformed.
+
+    Fail-closed semantics (#169): an *unset or empty* environment variable
+    legitimately falls back to its compile-time default, but a non-empty value
+    that cannot be parsed (a typo'd boolean, a non-numeric int, an unknown enum
+    token) is a configuration mistake that must surface loudly rather than be
+    silently swallowed into the default. The error always names the offending
+    key so the operator knows exactly which line of their ``.env`` to fix.
+    """
 
 
-def _int(value: str, *, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
+_TRUE_TOKENS: Final[frozenset[str]] = frozenset({"1", "true", "t", "yes", "y"})
+_FALSE_TOKENS: Final[frozenset[str]] = frozenset({"0", "false", "f", "no", "n"})
+
+
+def _bool(value: str, *, default: bool, key: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    # Empty/unset → legitimate fallback to default.
+    if not normalized:
         return default
+    if normalized in _TRUE_TOKENS:
+        return True
+    if normalized in _FALSE_TOKENS:
+        return False
+    raise ConfigError(
+        f"{key}: invalid boolean value {value!r}. "
+        f"Expected one of {sorted(_TRUE_TOKENS | _FALSE_TOKENS)} (or leave unset for default)."
+    )
 
 
-def _int_optional(value: str) -> int | None:
+def _int(value: str, *, default: int, key: str) -> int:
     text = str(value or "").strip()
+    # Empty/unset → legitimate fallback to default.
+    if not text:
+        return default
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{key}: invalid integer value {value!r} (or leave unset for default).") from None
+
+
+def _int_optional(value: str, *, key: str) -> int | None:
+    text = str(value or "").strip()
+    # Empty/unset → None (the "optional/unbounded" sentinel), never an error.
     if not text:
         return None
     try:
         return int(text)
     except (TypeError, ValueError):
-        return None
+        raise ConfigError(f"{key}: invalid integer value {value!r} (or leave unset for the default/unbounded).") from None
+
+
+def _enum(value: str, *, default: str, allowed: frozenset[str], key: str) -> str:
+    """Validate an enum-like string against an allowed set, fail-closed.
+
+    Normalizes to lowercase/stripped. Empty/unset falls back to ``default``;
+    a non-empty value outside ``allowed`` raises a ConfigError naming the key
+    and the permitted tokens (#169).
+    """
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return default
+    if normalized in allowed:
+        return normalized
+    raise ConfigError(
+        f"{key}: invalid value {value!r}. Expected one of {sorted(allowed)} (or leave unset for default {default!r})."
+    )
 
 
 def _build_settings() -> Settings:
@@ -323,47 +367,75 @@ def _build_settings() -> Settings:
         items = [part.strip() for part in raw.split(",") if part.strip()]
         return items
 
+    # Name-keyed parser wrappers (#169). These read the env var and parse it
+    # fail-closed, automatically threading the env-var *name* into the parser
+    # so that a malformed explicit value raises a ConfigError that names the
+    # offending key. We pass an empty decouple default so that "unset" always
+    # reaches the parser as "" and falls through to the typed default — never
+    # an error. The decouple default is irrelevant for parsing (it is only the
+    # fallback raw string), so we use "" uniformly.
+    def _b(name: str, *, default: bool) -> bool:
+        return _bool(decouple_config(name, default=""), default=default, key=name)
+
+    def _i(name: str, *, default: int) -> int:
+        return _int(decouple_config(name, default=""), default=default, key=name)
+
+    def _io(name: str, *, default: int | None = None) -> int | None:
+        # Empty/unset → the supplied default (None means "unbounded"); a
+        # non-empty value is parsed fail-closed (raises on garbage). Note we
+        # cannot push ``default`` through decouple as a string, because a
+        # malformed *explicit* value must still raise — so handle empty here.
+        raw = str(decouple_config(name, default="") or "").strip()
+        if not raw:
+            return default
+        return _int_optional(raw, key=name)
+
     http_settings = HttpSettings(
         host=decouple_config("HTTP_HOST", default="127.0.0.1"),
-        port=_int(decouple_config("HTTP_PORT", default="8765"), default=8765),
+        port=_i("HTTP_PORT", default=8765),
         path=decouple_config("HTTP_PATH", default="/api/"),
         bearer_token=decouple_config("HTTP_BEARER_TOKEN", default="") or None,
-        rate_limit_enabled=_bool(decouple_config("HTTP_RATE_LIMIT_ENABLED", default="false"), default=False),
-        rate_limit_per_minute=_int(decouple_config("HTTP_RATE_LIMIT_PER_MINUTE", default="60"), default=60),
-        rate_limit_backend=decouple_config("HTTP_RATE_LIMIT_BACKEND", default="memory").lower(),
-        rate_limit_tools_per_minute=_int(decouple_config("HTTP_RATE_LIMIT_TOOLS_PER_MINUTE", default="60"), default=60),
-        rate_limit_resources_per_minute=_int(decouple_config("HTTP_RATE_LIMIT_RESOURCES_PER_MINUTE", default="120"), default=120),
+        rate_limit_enabled=_b("HTTP_RATE_LIMIT_ENABLED", default=False),
+        rate_limit_per_minute=_i("HTTP_RATE_LIMIT_PER_MINUTE", default=60),
+        rate_limit_backend=_enum(
+            decouple_config("HTTP_RATE_LIMIT_BACKEND", default=""),
+            default="memory",
+            allowed=frozenset({"memory", "redis"}),
+            key="HTTP_RATE_LIMIT_BACKEND",
+        ),
+        rate_limit_tools_per_minute=_i("HTTP_RATE_LIMIT_TOOLS_PER_MINUTE", default=60),
+        rate_limit_resources_per_minute=_i("HTTP_RATE_LIMIT_RESOURCES_PER_MINUTE", default=120),
         rate_limit_redis_url=decouple_config("HTTP_RATE_LIMIT_REDIS_URL", default=""),
-        rate_limit_tools_burst=_int(decouple_config("HTTP_RATE_LIMIT_TOOLS_BURST", default="0"), default=0),
-        rate_limit_resources_burst=_int(decouple_config("HTTP_RATE_LIMIT_RESOURCES_BURST", default="0"), default=0),
-        request_log_enabled=_bool(decouple_config("HTTP_REQUEST_LOG_ENABLED", default="false"), default=False),
-        otel_enabled=_bool(decouple_config("HTTP_OTEL_ENABLED", default="false"), default=False),
+        rate_limit_tools_burst=_i("HTTP_RATE_LIMIT_TOOLS_BURST", default=0),
+        rate_limit_resources_burst=_i("HTTP_RATE_LIMIT_RESOURCES_BURST", default=0),
+        request_log_enabled=_b("HTTP_REQUEST_LOG_ENABLED", default=False),
+        otel_enabled=_b("HTTP_OTEL_ENABLED", default=False),
         otel_service_name=decouple_config("OTEL_SERVICE_NAME", default="mcp-agent-mail"),
         otel_exporter_otlp_endpoint=decouple_config("OTEL_EXPORTER_OTLP_ENDPOINT", default=""),
-        jwt_enabled=_bool(decouple_config("HTTP_JWT_ENABLED", default="false"), default=False),
+        jwt_enabled=_b("HTTP_JWT_ENABLED", default=False),
         jwt_algorithms=_csv("HTTP_JWT_ALGORITHMS", default="HS256"),
         jwt_secret=decouple_config("HTTP_JWT_SECRET", default="") or None,
         jwt_jwks_url=decouple_config("HTTP_JWT_JWKS_URL", default="") or None,
         jwt_audience=decouple_config("HTTP_JWT_AUDIENCE", default="") or None,
         jwt_issuer=decouple_config("HTTP_JWT_ISSUER", default="") or None,
         jwt_role_claim=decouple_config("HTTP_JWT_ROLE_CLAIM", default="role") or "role",
-        rbac_enabled=_bool(decouple_config("HTTP_RBAC_ENABLED", default="true"), default=True),
+        rbac_enabled=_b("HTTP_RBAC_ENABLED", default=True),
         rbac_reader_roles=_csv("HTTP_RBAC_READER_ROLES", default="reader,read,ro"),
         rbac_writer_roles=_csv("HTTP_RBAC_WRITER_ROLES", default="writer,write,tools,rw"),
-        rbac_default_role=decouple_config("HTTP_RBAC_DEFAULT_ROLE", default="reader"),
+        rbac_default_role=decouple_config("HTTP_RBAC_DEFAULT_ROLE", default="reader").strip() or "reader",
         rbac_readonly_tools=_csv(
             "HTTP_RBAC_READONLY_TOOLS",
             default="health_check,fetch_inbox,whois,search_messages,summarize_thread",
         ),
-        allow_localhost_unauthenticated=_bool(decouple_config("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", default="true"), default=True),
+        allow_localhost_unauthenticated=_b("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", default=True),
     )
 
     database_settings = DatabaseSettings(
         url=decouple_config("DATABASE_URL", default="sqlite+aiosqlite:///./storage.sqlite3"),
-        echo=_bool(decouple_config("DATABASE_ECHO", default="false"), default=False),
-        pool_size=_int_optional(decouple_config("DATABASE_POOL_SIZE", default="50")),
-        max_overflow=_int_optional(decouple_config("DATABASE_MAX_OVERFLOW", default="")),
-        pool_timeout=_int_optional(decouple_config("DATABASE_POOL_TIMEOUT", default="")),
+        echo=_b("DATABASE_ECHO", default=False),
+        pool_size=_io("DATABASE_POOL_SIZE", default=50),
+        max_overflow=_io("DATABASE_MAX_OVERFLOW"),
+        pool_timeout=_io("DATABASE_POOL_TIMEOUT"),
     )
 
     allow_abs_default = "false"
@@ -372,80 +444,94 @@ def _build_settings() -> Settings:
         root=decouple_config("STORAGE_ROOT", default="~/.mcp_agent_mail_git_mailbox_repo"),
         git_author_name=decouple_config("GIT_AUTHOR_NAME", default="mcp-agent"),
         git_author_email=decouple_config("GIT_AUTHOR_EMAIL", default="mcp-agent@example.com"),
-        inline_image_max_bytes=_int(decouple_config("INLINE_IMAGE_MAX_BYTES", default=str(64 * 1024)), default=64 * 1024),
-        convert_images=_bool(decouple_config("CONVERT_IMAGES", default="true"), default=True),
-        keep_original_images=_bool(decouple_config("KEEP_ORIGINAL_IMAGES", default="false"), default=False),
-        allow_absolute_attachment_paths=_bool(
-            decouple_config("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", default=allow_abs_default),
-            default=allow_abs_default == "true",
-        ),
+        inline_image_max_bytes=_i("INLINE_IMAGE_MAX_BYTES", default=64 * 1024),
+        convert_images=_b("CONVERT_IMAGES", default=True),
+        keep_original_images=_b("KEEP_ORIGINAL_IMAGES", default=False),
+        allow_absolute_attachment_paths=_b("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", default=allow_abs_default == "true"),
     )
 
-    cors_default = "true" if environment.lower() == "development" else "false"
     cors_settings = CorsSettings(
-        enabled=_bool(decouple_config("HTTP_CORS_ENABLED", default=cors_default), default=cors_default == "true"),
+        enabled=_b("HTTP_CORS_ENABLED", default=environment.lower() == "development"),
         origins=_csv("HTTP_CORS_ORIGINS", default=""),
-        allow_credentials=_bool(decouple_config("HTTP_CORS_ALLOW_CREDENTIALS", default="false"), default=False),
+        allow_credentials=_b("HTTP_CORS_ALLOW_CREDENTIALS", default=False),
         allow_methods=_csv("HTTP_CORS_ALLOW_METHODS", default="*"),
         allow_headers=_csv("HTTP_CORS_ALLOW_HEADERS", default="*"),
     )
 
-    def _float(value: str, *, default: float) -> float:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
+    def _float(value: str, *, default: float, key: str) -> float:
+        text = str(value or "").strip()
+        # Empty/unset → legitimate fallback to default.
+        if not text:
             return default
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            raise ConfigError(f"{key}: invalid float value {value!r} (or leave unset for default).") from None
+
+    def _f(name: str, *, default: float) -> float:
+        return _float(decouple_config(name, default=""), default=default, key=name)
 
     llm_settings = LlmSettings(
-        enabled=_bool(decouple_config("LLM_ENABLED", default="false"), default=False),
+        enabled=_b("LLM_ENABLED", default=False),
         default_model=decouple_config("LLM_DEFAULT_MODEL", default="gpt-4o-mini"),
-        temperature=_float(decouple_config("LLM_TEMPERATURE", default="0.2"), default=0.2),
-        max_tokens=_int(decouple_config("LLM_MAX_TOKENS", default="512"), default=512),
-        cache_enabled=_bool(decouple_config("LLM_CACHE_ENABLED", default="true"), default=True),
-        cache_backend=decouple_config("LLM_CACHE_BACKEND", default="memory"),
+        temperature=_f("LLM_TEMPERATURE", default=0.2),
+        max_tokens=_i("LLM_MAX_TOKENS", default=512),
+        cache_enabled=_b("LLM_CACHE_ENABLED", default=True),
+        cache_backend=_enum(
+            decouple_config("LLM_CACHE_BACKEND", default=""),
+            default="memory",
+            allowed=frozenset({"memory", "redis"}),
+            key="LLM_CACHE_BACKEND",
+        ),
         cache_redis_url=decouple_config("LLM_CACHE_REDIS_URL", default=""),
-        cost_logging_enabled=_bool(decouple_config("LLM_COST_LOGGING_ENABLED", default="true"), default=True),
+        cost_logging_enabled=_b("LLM_COST_LOGGING_ENABLED", default=True),
     )
 
     def _tool_filter_profile(value: str) -> str:
-        v = (value or "").strip().lower()
-        if v in {"full", "core", "minimal", "messaging", "custom"}:
-            return v
-        return "full"
+        return _enum(
+            value,
+            default="full",
+            allowed=frozenset({"full", "core", "minimal", "messaging", "custom"}),
+            key="TOOLS_FILTER_PROFILE",
+        )
 
     def _tool_filter_mode(value: str) -> str:
-        v = (value or "").strip().lower()
-        if v in {"include", "exclude"}:
-            return v
-        return "include"
+        return _enum(
+            value,
+            default="include",
+            allowed=frozenset({"include", "exclude"}),
+            key="TOOLS_FILTER_MODE",
+        )
 
     tool_filter_settings = ToolFilterSettings(
-        enabled=_bool(decouple_config("TOOLS_FILTER_ENABLED", default="false"), default=False),
-        profile=_tool_filter_profile(decouple_config("TOOLS_FILTER_PROFILE", default="full")),
-        mode=_tool_filter_mode(decouple_config("TOOLS_FILTER_MODE", default="include")),
+        enabled=_b("TOOLS_FILTER_ENABLED", default=False),
+        profile=_tool_filter_profile(decouple_config("TOOLS_FILTER_PROFILE", default="")),
+        mode=_tool_filter_mode(decouple_config("TOOLS_FILTER_MODE", default="")),
         clusters=_csv("TOOLS_FILTER_CLUSTERS", default=""),
         tools=_csv("TOOLS_FILTER_TOOLS", default=""),
     )
 
     notification_settings = NotificationSettings(
-        enabled=_bool(decouple_config("NOTIFICATIONS_ENABLED", default="false"), default=False),
+        enabled=_b("NOTIFICATIONS_ENABLED", default=False),
         signals_dir=decouple_config("NOTIFICATIONS_SIGNALS_DIR", default="~/.mcp_agent_mail/signals"),
-        include_metadata=_bool(decouple_config("NOTIFICATIONS_INCLUDE_METADATA", default="true"), default=True),
-        debounce_ms=_int(decouple_config("NOTIFICATIONS_DEBOUNCE_MS", default="100"), default=100),
+        include_metadata=_b("NOTIFICATIONS_INCLUDE_METADATA", default=True),
+        debounce_ms=_i("NOTIFICATIONS_DEBOUNCE_MS", default=100),
     )
 
     def _agent_name_mode(value: str) -> str:
-        v = (value or "").strip().lower()
-        if v in {"strict", "coerce", "always_auto"}:
-            return v
-        return "coerce"
+        return _enum(
+            value,
+            default="coerce",
+            allowed=frozenset({"strict", "coerce", "always_auto"}),
+            key="AGENT_NAME_ENFORCEMENT_MODE",
+        )
 
     return Settings(
         environment=environment,
         # Gate: allow either legacy WORKTREES_ENABLED or new GIT_IDENTITY_ENABLED to enable features
         worktrees_enabled=(
-            _bool(decouple_config("WORKTREES_ENABLED", default="false"), default=False)
-            or _bool(decouple_config("GIT_IDENTITY_ENABLED", default="false"), default=False)
+            _b("WORKTREES_ENABLED", default=False)
+            or _b("GIT_IDENTITY_ENABLED", default=False)
         ),
         project_identity_mode=decouple_config("PROJECT_IDENTITY_MODE", default="dir").strip().lower(),
         project_identity_remote=decouple_config("PROJECT_IDENTITY_REMOTE", default="origin").strip(),
@@ -456,71 +542,64 @@ def _build_settings() -> Settings:
         llm=llm_settings,
         tool_filter=tool_filter_settings,
         notifications=notification_settings,
-        file_reservations_cleanup_enabled=_bool(decouple_config("FILE_RESERVATIONS_CLEANUP_ENABLED", default="true"), default=True),
-        file_reservations_cleanup_interval_seconds=_int(decouple_config("FILE_RESERVATIONS_CLEANUP_INTERVAL_SECONDS", default="60"), default=60),
-        file_reservation_inactivity_seconds=_int(decouple_config("FILE_RESERVATION_INACTIVITY_SECONDS", default="1800"), default=1800),
-        file_reservation_activity_grace_seconds=_int(decouple_config("FILE_RESERVATION_ACTIVITY_GRACE_SECONDS", default="900"), default=900),
-        file_reservations_enforcement_enabled=_bool(decouple_config("FILE_RESERVATIONS_ENFORCEMENT_ENABLED", default="true"), default=True),
-        ack_ttl_enabled=_bool(decouple_config("ACK_TTL_ENABLED", default="false"), default=False),
-        ack_ttl_seconds=_int(decouple_config("ACK_TTL_SECONDS", default="1800"), default=1800),
-        ack_ttl_scan_interval_seconds=_int(decouple_config("ACK_TTL_SCAN_INTERVAL_SECONDS", default="60"), default=60),
-        ack_escalation_enabled=_bool(decouple_config("ACK_ESCALATION_ENABLED", default="false"), default=False),
-        ack_escalation_mode=decouple_config("ACK_ESCALATION_MODE", default="log"),
-        ack_escalation_claim_ttl_seconds=_int(decouple_config("ACK_ESCALATION_CLAIM_TTL_SECONDS", default="3600"), default=3600),
-        ack_escalation_claim_exclusive=_bool(decouple_config("ACK_ESCALATION_CLAIM_EXCLUSIVE", default="false"), default=False),
+        file_reservations_cleanup_enabled=_b("FILE_RESERVATIONS_CLEANUP_ENABLED", default=True),
+        file_reservations_cleanup_interval_seconds=_i("FILE_RESERVATIONS_CLEANUP_INTERVAL_SECONDS", default=60),
+        file_reservation_inactivity_seconds=_i("FILE_RESERVATION_INACTIVITY_SECONDS", default=1800),
+        file_reservation_activity_grace_seconds=_i("FILE_RESERVATION_ACTIVITY_GRACE_SECONDS", default=900),
+        file_reservations_enforcement_enabled=_b("FILE_RESERVATIONS_ENFORCEMENT_ENABLED", default=True),
+        ack_ttl_enabled=_b("ACK_TTL_ENABLED", default=False),
+        ack_ttl_seconds=_i("ACK_TTL_SECONDS", default=1800),
+        ack_ttl_scan_interval_seconds=_i("ACK_TTL_SCAN_INTERVAL_SECONDS", default=60),
+        ack_escalation_enabled=_b("ACK_ESCALATION_ENABLED", default=False),
+        ack_escalation_mode=_enum(
+            decouple_config("ACK_ESCALATION_MODE", default=""),
+            default="log",
+            allowed=frozenset({"log", "file_reservation"}),
+            key="ACK_ESCALATION_MODE",
+        ),
+        ack_escalation_claim_ttl_seconds=_i("ACK_ESCALATION_CLAIM_TTL_SECONDS", default=3600),
+        ack_escalation_claim_exclusive=_b("ACK_ESCALATION_CLAIM_EXCLUSIVE", default=False),
         ack_escalation_claim_holder_name=decouple_config("ACK_ESCALATION_CLAIM_HOLDER_NAME", default=""),
-        tools_log_enabled=_bool(decouple_config("TOOLS_LOG_ENABLED", default="true"), default=True),
-        instrumentation_enabled=_bool(decouple_config("INSTRUMENTATION_ENABLED", default="false"), default=False),
-        instrumentation_slow_query_ms=_int(decouple_config("INSTRUMENTATION_SLOW_QUERY_MS", default="250"), default=250),
-        log_rich_enabled=_bool(decouple_config("LOG_RICH_ENABLED", default="true"), default=True),
+        tools_log_enabled=_b("TOOLS_LOG_ENABLED", default=True),
+        instrumentation_enabled=_b("INSTRUMENTATION_ENABLED", default=False),
+        instrumentation_slow_query_ms=_i("INSTRUMENTATION_SLOW_QUERY_MS", default=250),
+        log_rich_enabled=_b("LOG_RICH_ENABLED", default=True),
         log_level=decouple_config("LOG_LEVEL", default="INFO"),
-        log_include_trace=_bool(decouple_config("LOG_INCLUDE_TRACE", default="false"), default=False),
-        contact_enforcement_enabled=_bool(decouple_config("CONTACT_ENFORCEMENT_ENABLED", default="true"), default=True),
-        contact_auto_ttl_seconds=_int(decouple_config("CONTACT_AUTO_TTL_SECONDS", default="86400"), default=86400),
-        contact_pending_ttl_seconds=_int(decouple_config("CONTACT_PENDING_TTL_SECONDS", default="604800"), default=604800),
-        contact_auto_retry_enabled=_bool(decouple_config("CONTACT_AUTO_RETRY_ENABLED", default="true"), default=True),
-        log_json_enabled=_bool(decouple_config("LOG_JSON_ENABLED", default="false"), default=False),
+        log_include_trace=_b("LOG_INCLUDE_TRACE", default=False),
+        contact_enforcement_enabled=_b("CONTACT_ENFORCEMENT_ENABLED", default=True),
+        contact_auto_ttl_seconds=_i("CONTACT_AUTO_TTL_SECONDS", default=86400),
+        contact_pending_ttl_seconds=_i("CONTACT_PENDING_TTL_SECONDS", default=604800),
+        contact_auto_retry_enabled=_b("CONTACT_AUTO_RETRY_ENABLED", default=True),
+        log_json_enabled=_b("LOG_JSON_ENABLED", default=False),
         output_format_default=decouple_config("MCP_AGENT_MAIL_OUTPUT_FORMAT", default="").strip().lower(),
         toon_default_format=decouple_config("TOON_DEFAULT_FORMAT", default="").strip().lower(),
-        toon_stats_enabled=_bool(decouple_config("TOON_STATS", default="false"), default=False),
+        toon_stats_enabled=_b("TOON_STATS", default=False),
         toon_bin=(
             decouple_config("TOON_TRU_BIN", default="").strip()
             or decouple_config("TOON_BIN", default="").strip()
             or "tru"
         ),
-        tool_metrics_emit_enabled=_bool(decouple_config("TOOL_METRICS_EMIT_ENABLED", default="false"), default=False),
-        tool_metrics_emit_interval_seconds=_int(decouple_config("TOOL_METRICS_EMIT_INTERVAL_SECONDS", default="60"), default=60),
-        retention_report_enabled=_bool(decouple_config("RETENTION_REPORT_ENABLED", default="false"), default=False),
-        retention_report_interval_seconds=_int(decouple_config("RETENTION_REPORT_INTERVAL_SECONDS", default="3600"), default=3600),
-        retention_max_age_days=_int(decouple_config("RETENTION_MAX_AGE_DAYS", default="180"), default=180),
-        quota_enabled=_bool(decouple_config("QUOTA_ENABLED", default="false"), default=False),
-        quota_attachments_limit_bytes=_int(decouple_config("QUOTA_ATTACHMENTS_LIMIT_BYTES", default="0"), default=0),
-        quota_inbox_limit_count=_int(decouple_config("QUOTA_INBOX_LIMIT_COUNT", default="0"), default=0),
+        tool_metrics_emit_enabled=_b("TOOL_METRICS_EMIT_ENABLED", default=False),
+        tool_metrics_emit_interval_seconds=_i("TOOL_METRICS_EMIT_INTERVAL_SECONDS", default=60),
+        retention_report_enabled=_b("RETENTION_REPORT_ENABLED", default=False),
+        retention_report_interval_seconds=_i("RETENTION_REPORT_INTERVAL_SECONDS", default=3600),
+        retention_max_age_days=_i("RETENTION_MAX_AGE_DAYS", default=180),
+        quota_enabled=_b("QUOTA_ENABLED", default=False),
+        quota_attachments_limit_bytes=_i("QUOTA_ATTACHMENTS_LIMIT_BYTES", default=0),
+        quota_inbox_limit_count=_i("QUOTA_INBOX_LIMIT_COUNT", default=0),
         retention_ignore_project_patterns=_csv(
             "RETENTION_IGNORE_PROJECT_PATTERNS",
             default="demo,test*,testproj*,testproject,backendproj*,frontendproj*",
         ),
-        agent_name_enforcement_mode=_agent_name_mode(decouple_config("AGENT_NAME_ENFORCEMENT_MODE", default="coerce")),
-        messaging_auto_register_recipients=_bool(decouple_config("MESSAGING_AUTO_REGISTER_RECIPIENTS", default="false"), default=False),
-        messaging_auto_handshake_on_block=_bool(decouple_config("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", default="true"), default=True),
+        agent_name_enforcement_mode=_agent_name_mode(decouple_config("AGENT_NAME_ENFORCEMENT_MODE", default="")),
+        messaging_auto_register_recipients=_b("MESSAGING_AUTO_REGISTER_RECIPIENTS", default=False),
+        messaging_auto_handshake_on_block=_b("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", default=True),
         window_identity_uuid=decouple_config("MCP_AGENT_MAIL_WINDOW_ID", default="").strip(),
-        window_identity_ttl_days=_int(decouple_config("MCP_AGENT_MAIL_WINDOW_TTL_DAYS", default="30"), default=30),
-        session_binding_ttl_seconds=_int(
-            decouple_config("MCP_AGENT_MAIL_SESSION_BINDING_TTL_SECONDS", default="86400"),
-            default=86400,
-        ),
-        auto_retire_stale_agents_enabled=_bool(
-            decouple_config("AUTO_RETIRE_STALE_AGENTS_ENABLED", default="true"),
-            default=True,
-        ),
-        auto_retire_stale_agents_interval_seconds=_int(
-            decouple_config("AUTO_RETIRE_STALE_AGENTS_INTERVAL_SECONDS", default="3600"),
-            default=3600,
-        ),
-        auto_retire_stale_agents_threshold_seconds=_int(
-            decouple_config("AUTO_RETIRE_STALE_AGENTS_THRESHOLD_SECONDS", default="86400"),
-            default=86400,
-        ),
+        window_identity_ttl_days=_i("MCP_AGENT_MAIL_WINDOW_TTL_DAYS", default=30),
+        session_binding_ttl_seconds=_i("MCP_AGENT_MAIL_SESSION_BINDING_TTL_SECONDS", default=86400),
+        auto_retire_stale_agents_enabled=_b("AUTO_RETIRE_STALE_AGENTS_ENABLED", default=True),
+        auto_retire_stale_agents_interval_seconds=_i("AUTO_RETIRE_STALE_AGENTS_INTERVAL_SECONDS", default=3600),
+        auto_retire_stale_agents_threshold_seconds=_i("AUTO_RETIRE_STALE_AGENTS_THRESHOLD_SECONDS", default=86400),
     )
 
 
