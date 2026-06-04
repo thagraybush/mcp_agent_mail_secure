@@ -1580,18 +1580,35 @@ async def write_message_bundle(
         if sender_outbox_name
         else None
     )
-    inbox_dirs = [archive.root / "agents" / r / "inbox" / y_dir / m_dir for r in recipients]
+    inbox_dirs = [(r, archive.root / "agents" / r / "inbox" / y_dir / m_dir) for r in recipients]
 
     rel_paths: list[str] = []
 
     await _to_thread(canonical_dir.mkdir, parents=True, exist_ok=True)
     if outbox_dir is not None:
         await _to_thread(outbox_dir.mkdir, parents=True, exist_ok=True)
-    for path in inbox_dirs:
+    for _r, path in inbox_dirs:
         await _to_thread(path.mkdir, parents=True, exist_ok=True)
 
-    frontmatter = json.dumps(message, indent=2, sort_keys=True)
-    content = f"---json\n{frontmatter}\n---\n\n{body_md.strip()}\n"
+    # BCC privacy (issue #186): the full bcc list is only ever visible to the
+    # sender. Canonical/outbox copies are the sender's own record and keep the
+    # full frontmatter; per-recipient inbox copies must redact bcc so that a
+    # to/cc recipient cannot see who was blind-copied, and a bcc recipient only
+    # ever sees their own name (never the other blind copies).
+    bcc_list = message.get("bcc")
+    bcc_names = {str(name) for name in bcc_list} if isinstance(bcc_list, (list, tuple)) else set()
+
+    def _render_content(viewer: str | None) -> str:
+        if viewer is None or not bcc_names:
+            view_message = message
+        else:
+            view_message = dict(message)
+            view_message["bcc"] = [viewer] if viewer in bcc_names else []
+        frontmatter = json.dumps(view_message, indent=2, sort_keys=True)
+        return f"---json\n{frontmatter}\n---\n\n{body_md.strip()}\n"
+
+    # Sender-side copies (canonical archive + sender outbox) retain full bcc.
+    content = _render_content(None)
 
     # Descriptive, ISO-prefixed filename: <ISO>__<subject-slug>__<id>.md
     created_iso = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
@@ -1612,9 +1629,9 @@ async def write_message_bundle(
         await _write_text(outbox_path, content)
         rel_paths.append(outbox_path.relative_to(archive.repo_root).as_posix())
 
-    for inbox_dir in inbox_dirs:
+    for recipient_name, inbox_dir in inbox_dirs:
         inbox_path = inbox_dir / filename
-        await _write_text(inbox_path, content)
+        await _write_text(inbox_path, _render_content(recipient_name))
         rel_paths.append(inbox_path.relative_to(archive.repo_root).as_posix())
 
     # Update thread-level digest for human review if thread_id present

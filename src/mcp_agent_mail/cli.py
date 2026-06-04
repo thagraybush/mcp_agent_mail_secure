@@ -4290,6 +4290,7 @@ def projects_discovery_init(
     """
     Scaffold a discovery YAML file (.agent-mail.yaml) with project_uid (and optional product_uid).
     """
+    settings = get_settings()
     p = _canonical_project_path(project_path)
     root = _resolve_repo_worktree_root(p)
     from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident
@@ -4303,6 +4304,14 @@ def projects_discovery_init(
         lines.append(f"product_uid: {product}")
     ypath.write_text("\n".join(lines) + "\n", encoding="utf-8")
     console.print(f"[green]Wrote[/] {ypath}")
+    # The discovery YAML is only consulted by identity resolution when
+    # WORKTREES_ENABLED=1; otherwise it is inert. Make that explicit so users
+    # aren't left with a file that silently does nothing. (#208)
+    if not settings.worktrees_enabled:
+        console.print(
+            "[yellow]Note:[/] WORKTREES_ENABLED is not set, so this discovery file is currently "
+            "inert. Set WORKTREES_ENABLED=1 for it to take effect."
+        )
 @mail_app.command("status")
 def mail_status(
     project_path: Annotated[
