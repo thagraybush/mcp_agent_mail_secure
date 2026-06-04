@@ -1,12 +1,38 @@
+# ASPIRATIONAL SAMPLE — NOT WIRED UP OUT OF THE BOX.
+#
+# mcp-agent-mail does NOT ship a Prometheus exporter or a /metrics endpoint.
+# Tool instrumentation is exposed as a structured JSON snapshot, not as
+# Prometheus counters. The server records, per tool:
+#
+#     {"name": <tool>, "calls": <int>, "errors": <int>,
+#      "cluster": <str>, "capabilities": [...], "complexity": <str>}
+#
+# served via the MCP resource `resource://tooling/metrics`
+# (see `_tool_metrics_snapshot()` in src/mcp_agent_mail/app.py).
+#
+# The PromQL below references series named `mcp_tool_calls` / `mcp_tool_errors`
+# (labelled by `tool`) that DO NOT exist yet. To make this rule fire you must
+# first scrape the JSON snapshot and re-expose those fields as Prometheus
+# time series yourself — for example with a small sidecar that polls the
+# resource and publishes:
+#
+#     mcp_tool_calls{tool="..."}   <- snapshot["calls"]
+#     mcp_tool_errors{tool="..."}  <- snapshot["errors"]
+#
+# Because `calls`/`errors` are monotonically increasing process-lifetime
+# totals, `increase()`/`rate()` apply directly once exported as counters.
+# Until such an exporter exists, this file is documentation only.
 groups:
   - name: mcp-agent-mail
     interval: 30s
     rules:
       - alert: MCPHighToolErrorRate
+        # Requires an exporter that publishes mcp_tool_errors / mcp_tool_calls
+        # from the resource://tooling/metrics snapshot (see header).
         expr: |
-          sum by (tool) (rate(mcp_tool_errors_total[5m]))
+          sum by (tool) (increase(mcp_tool_errors[5m]))
             /
-          sum by (tool) (rate(mcp_tool_calls_total[5m]))
+          clamp_min(sum by (tool) (increase(mcp_tool_calls[5m])), 1)
           > 0.05
         for: 5m
         labels:
@@ -16,3 +42,5 @@ groups:
           description: |
             Over the last 5 minutes, tool {{ $labels.tool }} exceeded a 5% error ratio.
             Investigate recent changes, review capability assignments, or consider surfacing a macro.
+            NOTE: this alert only fires if you run an exporter that re-publishes the
+            resource://tooling/metrics JSON snapshot as Prometheus time series.

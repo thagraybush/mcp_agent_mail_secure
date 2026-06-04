@@ -163,10 +163,15 @@ def assert_matches_golden(
     paths = get_e2e_paths()
     golden_path = paths.golden_dir / f"{name}.json"
     normalized = normalize_output(actual, replacements)
-    if update or not golden_path.exists():
+    if update:
         write_json(golden_path, normalized)
         console.print(Panel(f"Wrote golden file {golden_path}", title="golden update", expand=False))
         return
+    if not golden_path.exists():
+        raise AssertionError(
+            f"Missing golden file for {name!r}: {golden_path}. "
+            "Generate it by running the e2e suite with E2E_UPDATE=1."
+        )
     expected = json.loads(golden_path.read_text(encoding="utf-8"))
     diffs = diff_payload(expected, normalized)
     if diffs:

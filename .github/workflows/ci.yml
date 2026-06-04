@@ -8,21 +8,24 @@ on:
 
 jobs:
   build-and-test:
-    name: Lint, Type Check, Test (${{ matrix.os }})
+    name: Lint, Type Check, Test (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        # Honor the requires-python floor (3.12) advertised in pyproject.toml
+        # alongside the primary 3.14 target used for Docker/release.
+        python-version: ['3.12', '3.14']
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.14
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: '3.14'
+          python-version: ${{ matrix.python-version }}
           allow-prereleases: true
 
       - name: Install uv
@@ -38,9 +41,9 @@ jobs:
           path: |
             ~/.cache/uv
             .venv
-          key: ci-uv-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+          key: ci-uv-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
           restore-keys: |
-            ci-uv-${{ runner.os }}-
+            ci-uv-${{ runner.os }}-py${{ matrix.python-version }}-
 
       - name: Sync dependencies
         shell: bash
@@ -78,7 +81,7 @@ jobs:
           RUN_BENCHMARKS: "1"
           INSTRUMENTATION_ENABLED: "true"
         run: |
-          uv run -m pytest tests/benchmarks/ -v -m benchmark --tb=short || true
+          uv run -m pytest tests/benchmarks/ -v -m benchmark --tb=short
 
       - name: CI Performance Regression Check (Ubuntu only)
         if: matrix.os == 'ubuntu-latest'
@@ -92,7 +95,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && always()
         uses: actions/upload-artifact@v4
         with:
-          name: regression-reports
+          name: regression-reports-py${{ matrix.python-version }}
           path: tests/benchmarks/regression_reports/
           if-no-files-found: ignore
           retention-days: 30
@@ -101,7 +104,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && always()
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results
+          name: benchmark-results-py${{ matrix.python-version }}
           path: tests/benchmarks/results/
           if-no-files-found: ignore
           retention-days: 30

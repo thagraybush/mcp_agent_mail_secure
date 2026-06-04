@@ -602,6 +602,16 @@ update_existing_repo() {
     return 0
   fi
 
+  # Guard against data loss: a hard reset to origin/BRANCH silently discards any
+  # local commits that have not been pushed. Only fast-forward when HEAD is an
+  # ancestor of origin/BRANCH; if local history has diverged, refuse to reset.
+  if ! (cd "${repo_path}" && git merge-base --is-ancestor HEAD "origin/${BRANCH}" 2>/dev/null); then
+    warn "Local repo has commits not on origin/${BRANCH}; refusing to reset (would discard your work)"
+    warn "Resolve manually: cd '${repo_path}' && git log --oneline origin/${BRANCH}..HEAD"
+    record_summary "Repo: update skipped (local commits diverge from origin/${BRANCH})"
+    return 0
+  fi
+
   # Stash any local changes to avoid conflicts
   local has_changes=0
   if (cd "${repo_path}" && git diff --quiet 2>/dev/null) && (cd "${repo_path}" && git diff --cached --quiet 2>/dev/null); then
