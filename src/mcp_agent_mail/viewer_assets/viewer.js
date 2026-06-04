@@ -1020,7 +1020,11 @@ function viewerController() {
       }
       while (ops.length > 0) output.push(ops.pop());
 
-      // 3) Build AST from RPN
+      // 3) Build AST from RPN.
+      // Returns null for malformed input (operators missing operands, or leftover
+      // operands), so callers treat it as a clean no-op rather than crashing on a
+      // stack underflow or an operator node with undefined children (e.g. a bare
+      // "NOT" or "a AND").
       function buildAst(rpn) {
         const stack = [];
         for (const t of rpn) {
@@ -1028,16 +1032,19 @@ function viewerController() {
             stack.push({ type: 'term', value: t.value });
           } else if (t.kind === 'op') {
             if (t.value === 'NOT') {
+              if (stack.length < 1) return null;
               const a = stack.pop();
               stack.push({ type: 'not', child: a });
             } else {
+              if (stack.length < 2) return null;
               const b = stack.pop();
               const a = stack.pop();
               stack.push({ type: t.value.toLowerCase(), left: a, right: b });
             }
           }
         }
-        return stack.pop() || null;
+        // A well-formed expression collapses to exactly one node.
+        return stack.length === 1 ? stack[0] : null;
       }
       const ast = buildAst(output);
       if (!ast) return new Set();
@@ -1085,6 +1092,7 @@ function viewerController() {
 
       // 5) LIKE fallback
       function buildLike(node, acc) {
+        if (!node) return;
         switch (node.type) {
           case 'term': {
             const needle = `%${String(node.value).toLowerCase()}%`;
@@ -1469,23 +1477,6 @@ function viewerController() {
 
       if (this.selectedThread && !this.isThreadVisible(this.selectedThread)) {
         this.selectedThread = null;
-      }
-
-      // Legacy compatibility: populate simple list for tests that look for #message-list li
-      try {
-        const compat = document.getElementById('message-list');
-        if (compat) {
-          compat.innerHTML = '';
-          const take = Math.min(10, this.filteredMessages.length);
-          for (let i = 0; i < take; i++) {
-            const msg = this.filteredMessages[i];
-            const li = document.createElement('li');
-            li.textContent = (msg && msg.subject) ? String(msg.subject) : '(no subject)';
-            compat.appendChild(li);
-          }
-        }
-      } catch (e) {
-        /* ignore */
       }
     },
 
