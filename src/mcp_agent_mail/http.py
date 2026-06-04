@@ -13,7 +13,7 @@ import logging
 import re
 from collections.abc import MutableMapping
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, cast
 
 import structlog
@@ -21,7 +21,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import NoResultFound
@@ -284,7 +284,7 @@ async def _delete_messages_from_archive(
     return len(git_paths_removed)
 
 
-__all__ = ["build_http_app", "main"]
+__all__ = ["build_http_app", "create_app", "main"]
 
 
 class _FastMCPHttpApp(Protocol):
@@ -577,11 +577,105 @@ def _configure_logging(settings: Settings) -> None:
     _LOGGING_CONFIGURED = True
 
 
+# In-process JWKS cache: avoid refetching the JWKS document on every request
+# (#212). Keyed by JWKS URL; entries expire after _JWKS_CACHE_TTL_SECONDS.
+_JWKS_CACHE_TTL_SECONDS = 300.0
+_jwks_cache: dict[str, tuple[float, Any]] = {}
+_jwks_cache_lock = asyncio.Lock()
+
+
+async def _fetch_jwks(jwks_url: str, *, force: bool = False):
+    """Return a parsed JWKS key set for ``jwks_url``, using a TTL cache.
+
+    On a cache miss/expiry (or when ``force`` is set, e.g. after an unknown
+    ``kid``), the document is refetched. On fetch/parse failure the last good
+    cached key set (if any) is returned so transient outages don't break auth.
+    """
+    from time import monotonic
+
+    jose_mod = importlib.import_module("authlib.jose")
+    JsonWebKey = jose_mod.JsonWebKey
+
+    now = monotonic()
+    async with _jwks_cache_lock:
+        cached = _jwks_cache.get(jwks_url)
+        if cached is not None and not force and (now - cached[0]) < _JWKS_CACHE_TTL_SECONDS:
+            return cached[1]
+
+    try:
+        httpx = importlib.import_module("httpx")
+        AsyncClient = httpx.AsyncClient
+        async with AsyncClient(timeout=5) as client:
+            jwks = (await client.get(jwks_url)).json()
+        key_set = JsonWebKey.import_key_set(jwks)
+    except Exception:
+        # Fall back to any cached (possibly stale) key set on fetch failure.
+        async with _jwks_cache_lock:
+            cached = _jwks_cache.get(jwks_url)
+        return cached[1] if cached is not None else None
+
+    async with _jwks_cache_lock:
+        _jwks_cache[jwks_url] = (monotonic(), key_set)
+    return key_set
+
+
+def _select_jwks_key(key_set, header: dict, algorithms: list[str]):
+    """Resolve the verification key from a JWKS key set by ``kid``.
+
+    Never blindly picks ``keys[0]`` (#211). With a ``kid`` we look it up
+    directly; an unknown ``kid`` returns ``None``. Without a ``kid`` this also
+    returns ``None`` -- the caller falls back to verifying against each
+    algorithm-compatible candidate (see ``_jwks_candidate_keys``) instead.
+    """
+    kid = header.get("kid")
+    if kid:
+        with contextlib.suppress(Exception):
+            return key_set.find_by_kid(kid)
+    return None
+
+
+def _jwks_candidate_keys(key_set, header: dict, algorithms: list[str]) -> list:
+    """Return JWKS keys to try when no ``kid`` is present.
+
+    Filters by signing use and by algorithm compatibility (matching the key's
+    declared ``alg`` when present, otherwise the key type implied by the
+    configured algorithms). Blind ``keys[0]`` selection is never used.
+    """
+    alg_set = {str(a) for a in algorithms}
+    # Map configured JWS algorithms to acceptable JWK key types.
+    kty_for_alg = {
+        "HS": "oct", "RS": "RSA", "PS": "RSA",
+        "ES": "EC", "Ed": "OKP",
+    }
+    wanted_kty = {kty_for_alg[a[:2]] for a in alg_set if a[:2] in kty_for_alg}
+    candidates = []
+    for key in list(getattr(key_set, "keys", []) or []):
+        with contextlib.suppress(Exception):
+            use = key.tokens.get("use") if hasattr(key, "tokens") else None
+            if use not in (None, "sig"):
+                continue
+            key_alg = key.tokens.get("alg") if hasattr(key, "tokens") else None
+            if key_alg is not None and str(key_alg) not in alg_set:
+                continue
+            kty = getattr(key, "kty", None) or (key.tokens.get("kty") if hasattr(key, "tokens") else None)
+            if wanted_kty and kty is not None and kty not in wanted_kty:
+                continue
+            candidates.append(key)
+    return candidates
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: FastAPI, token: str, allow_localhost: bool = False) -> None:
+    def __init__(
+        self, app: FastAPI, token: str, allow_localhost: bool = False, jwt_enabled: bool = False
+    ) -> None:
         super().__init__(app)
         self._token = token
         self._allow_localhost = allow_localhost
+        # When JWT auth is also enabled, a static-bearer mismatch must NOT
+        # short-circuit before the inner SecurityAndRateLimitMiddleware gets a
+        # chance to validate a JWT (#210). In that case we accept any Bearer
+        # token here and let the JWT path render the final auth decision.
+        self._jwt_enabled = jwt_enabled
 
     @staticmethod
     def _is_localhost(host: str) -> bool:
@@ -616,9 +710,14 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         auth_header = request.headers.get("Authorization", "")
         expected_header = f"Bearer {self._token}"
         # Use constant-time comparison to prevent timing attacks
-        if not hmac.compare_digest(auth_header, expected_header):
-            return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
-        return await call_next(request)
+        if hmac.compare_digest(auth_header, expected_header):
+            return await call_next(request)
+        # Static bearer did not match. If JWT auth is enabled, defer to the inner
+        # JWT-validating middleware instead of rejecting here, so EITHER a valid
+        # static bearer OR a valid JWT is accepted (#210).
+        if self._jwt_enabled and auth_header.startswith("Bearer "):
+            return await call_next(request)
+        return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
 
 
 def _localhost_bypass_allowed(request: Request, *, allow_localhost: bool) -> bool:
@@ -696,28 +795,39 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
             if header is None:
                 return None
             key = None
+            candidate_keys: list = []
             if jwks_url:
                 with contextlib.suppress(Exception):
-                    httpx = importlib.import_module("httpx")
-                    AsyncClient = httpx.AsyncClient
-                    async with AsyncClient(timeout=5) as client:
-                        jwks = (await client.get(jwks_url)).json()
-                    key_set = JsonWebKey.import_key_set(jwks)
-                    kid = header.get("kid")
-                    key = key_set.find_by_kid(kid) if kid else key_set.keys[0]
+                    key_set = await _fetch_jwks(jwks_url)
+                    if key_set is None:
+                        return None
+                    if header.get("kid"):
+                        key = _select_jwks_key(key_set, header, algs)
+                        # Unknown kid: the cached JWKS may be stale; force a
+                        # refresh once before giving up (#212).
+                        if key is None:
+                            key_set = await _fetch_jwks(jwks_url, force=True)
+                            if key_set is not None:
+                                key = _select_jwks_key(key_set, header, algs)
+                    else:
+                        # No kid: never blind-pick keys[0]. Try every
+                        # algorithm-compatible key during verification (#211).
+                        candidate_keys = _jwks_candidate_keys(key_set, header, algs)
             elif secret:
                 with contextlib.suppress(Exception):
                     key = JsonWebKey.import_key(secret, {"kty": "oct"})
-            if key is None:
+            keys_to_try = candidate_keys if candidate_keys else ([key] if key is not None else [])
+            if not keys_to_try:
                 return None
-            with contextlib.suppress(Exception):
-                claims = jwt.decode(token, key)
-                if audience:
-                    claims.validate_aud(audience)
-                if issuer and str(claims.get("iss") or "") != issuer:
-                    return None
-                claims.validate()
-                return dict(claims)
+            for candidate in keys_to_try:
+                with contextlib.suppress(Exception):
+                    claims = jwt.decode(token, candidate)
+                    if audience:
+                        claims.validate_aud(audience)
+                    if issuer and str(claims.get("iss") or "") != issuer:
+                        continue
+                    claims.validate()
+                    return dict(claims)
         return None
 
     @staticmethod
@@ -741,17 +851,30 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
             return "other", None
         return "other", None
 
+    @staticmethod
+    def _coerce_rpm(value: object, default: int) -> int:
+        # An explicit 0 disables the limit and must survive (#213); only a
+        # missing/None value falls back to the default. Use a None check rather
+        # than ``value or default`` (which would turn 0 into ``default``).
+        if value is None:
+            return default
+        with contextlib.suppress(Exception):
+            return int(value)
+        return default
+
     def _rate_limits_for(self, kind: str) -> tuple[int, int]:
         # return (per_minute, burst)
         if kind == "tools":
-            rpm = int(getattr(self.settings.http, "rate_limit_tools_per_minute", 60) or 60)
+            rpm = self._coerce_rpm(getattr(self.settings.http, "rate_limit_tools_per_minute", 60), 60)
             burst = int(getattr(self.settings.http, "rate_limit_tools_burst", 0) or 0)
         elif kind == "resources":
-            rpm = int(getattr(self.settings.http, "rate_limit_resources_per_minute", 120) or 120)
+            rpm = self._coerce_rpm(getattr(self.settings.http, "rate_limit_resources_per_minute", 120), 120)
             burst = int(getattr(self.settings.http, "rate_limit_resources_burst", 0) or 0)
         else:
-            rpm = int(getattr(self.settings.http, "rate_limit_per_minute", 60) or 60)
+            rpm = self._coerce_rpm(getattr(self.settings.http, "rate_limit_per_minute", 60), 60)
             burst = 0
+        # rpm <= 0 means "disabled" (handled by _consume_bucket); don't synthesize
+        # a positive burst that would re-enable limiting.
         burst = int(burst) if burst > 0 else max(1, rpm)
         return rpm, burst
 
@@ -923,6 +1046,16 @@ async def readiness_check() -> None:
                 f"({round(headroom_pct * 100, 1)}% headroom). "
                 f"Lock telemetry: {lock_stats}"
             )
+
+
+def create_app() -> FastAPI:
+    """Zero-argument ASGI app factory for ``uvicorn ... --factory`` (#214).
+
+    ``build_http_app`` requires a ``Settings`` argument, so it cannot be used
+    directly as a uvicorn ``--factory`` target. This wrapper resolves settings
+    from the environment and builds the app, matching the documented command.
+    """
+    return build_http_app(get_settings())
 
 
 def build_http_app(settings: Settings, server=None) -> FastAPI:
@@ -1307,46 +1440,71 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         class RequestLoggingMiddleware(BaseHTTPMiddleware):
             async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
                 start = _time.time()
-                response = await call_next(request)
-                dur_ms = int((_time.time() - start) * 1000)
                 method = request.method
                 path = request.url.path
-                status_code = getattr(response, "status_code", 0)
                 client = request.client.host if request.client else "-"
-                with contextlib.suppress(Exception):
-                    structlog.get_logger("http").info(
-                        "request",
-                        method=method,
-                        path=path,
-                        status=status_code,
-                        duration_ms=dur_ms,
-                        client_ip=client,
-                    )
+                response = None
+                exc: BaseException | None = None
                 try:
-                    rich_console = importlib.import_module("rich.console")
-                    rich_panel = importlib.import_module("rich.panel")
-                    rich_text = importlib.import_module("rich.text")
-                    Console = rich_console.Console
-                    Panel = rich_panel.Panel
-                    Text = rich_text.Text
-                    console = Console(width=100)
-                    title = Text.assemble(
-                        (method, "bold blue"),
-                        ("  "),
-                        (path, "bold white"),
-                        ("  "),
-                        (f"{status_code}", "bold green" if 200 <= status_code < 400 else "bold red"),
-                        ("  "),
-                        (f"{dur_ms}ms", "bold yellow"),
-                    )
-                    body = Text.assemble(
-                        ("client: ", "cyan"),
-                        (client, "white"),
-                    )
-                    console.print(Panel(body, title=title, border_style="dim"))
-                except Exception:
-                    print(f"http method={method} path={path} status={status_code} ms={dur_ms} client={client}")
-                return response
+                    response = await call_next(request)
+                    return response
+                except BaseException as err:  # noqa: BLE001 - log then re-raise
+                    exc = err
+                    raise
+                finally:
+                    # Always emit a log line, even when the handler raised (#215).
+                    dur_ms = int((_time.time() - start) * 1000)
+                    status_code = getattr(response, "status_code", 0) if response is not None else 500
+                    with contextlib.suppress(Exception):
+                        log = structlog.get_logger("http")
+                        if exc is not None:
+                            log.error(
+                                "request",
+                                method=method,
+                                path=path,
+                                status=status_code,
+                                duration_ms=dur_ms,
+                                client_ip=client,
+                                error=repr(exc),
+                            )
+                        else:
+                            log.info(
+                                "request",
+                                method=method,
+                                path=path,
+                                status=status_code,
+                                duration_ms=dur_ms,
+                                client_ip=client,
+                            )
+                    try:
+                        rich_console = importlib.import_module("rich.console")
+                        rich_panel = importlib.import_module("rich.panel")
+                        rich_text = importlib.import_module("rich.text")
+                        Console = rich_console.Console
+                        Panel = rich_panel.Panel
+                        Text = rich_text.Text
+                        console = Console(width=100)
+                        title = Text.assemble(
+                            (method, "bold blue"),
+                            ("  "),
+                            (path, "bold white"),
+                            ("  "),
+                            (f"{status_code}", "bold green" if 200 <= status_code < 400 else "bold red"),
+                            ("  "),
+                            (f"{dur_ms}ms", "bold yellow"),
+                        )
+                        body = Text.assemble(
+                            ("client: ", "cyan"),
+                            (client, "white"),
+                        )
+                        if exc is not None:
+                            body = Text.assemble(body, "\n", ("error: ", "cyan"), (repr(exc), "red"))
+                        console.print(Panel(body, title=title, border_style="dim"))
+                    except Exception:
+                        suffix = f" error={exc!r}" if exc is not None else ""
+                        print(
+                            f"http method={method} path={path} status={status_code} ms={dur_ms} client={client}{suffix}"
+                        )
 
         app_any = cast(Any, fastapi_app)
         app_any.add_middleware(RequestLoggingMiddleware)
@@ -1367,6 +1525,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             BearerAuthMiddleware,
             token=settings.http.bearer_token,
             allow_localhost=bool(getattr(settings.http, "allow_localhost_unauthenticated", False)),
+            jwt_enabled=bool(getattr(settings.http, "jwt_enabled", False)),
         )
 
     # Optional CORS
@@ -3819,6 +3978,43 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     raise HTTPException(status_code=404, detail="File not found")
 
                 return JSONResponse(content=content)
+            except ValueError as err:
+                # Path validation errors
+                raise HTTPException(status_code=400, detail="Invalid file path") from err
+            except HTTPException:
+                raise
+            except Exception as err:
+                raise HTTPException(status_code=404, detail="File not found") from err
+
+        @fastapi_app.get("/mail/archive/browser/{project}/download")
+        async def archive_browser_download(project: str, path: str) -> Response:
+            """Download a file from the archive as an attachment (#221)."""
+            # Validate project slug
+            if not _validate_project_slug(project):
+                raise HTTPException(status_code=400, detail="Invalid project identifier")
+
+            try:
+                settings = get_settings()
+                archive = await _open_existing_project_archive(settings, project)
+                if archive is None:
+                    raise HTTPException(status_code=404, detail="Project archive not found")
+                try:
+                    content = await get_file_content(archive, path)
+                finally:
+                    await asyncio.to_thread(archive.repo.close)
+
+                if content is None:
+                    raise HTTPException(status_code=404, detail="File not found")
+
+                # Derive a safe download filename from the (already validated)
+                # path's basename; strip any directory components and quotes.
+                filename = PurePosixPath(path.replace("\\", "/")).name or "download"
+                filename = filename.replace('"', "").replace("\r", "").replace("\n", "")
+                return Response(
+                    content=content,
+                    media_type="application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+                )
             except ValueError as err:
                 # Path validation errors
                 raise HTTPException(status_code=400, detail="Invalid file path") from err

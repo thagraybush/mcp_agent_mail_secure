@@ -379,7 +379,7 @@ Advanced (manual commands):
 ```bash
 uv run python -m mcp_agent_mail.http --host 127.0.0.1 --port 8765
 # or:
-uv run uvicorn mcp_agent_mail.http:build_http_app --factory --host 127.0.0.1 --port 8765
+uv run uvicorn mcp_agent_mail.http:create_app --factory --host 127.0.0.1 --port 8765
 ```
 
 Auth notes:
@@ -2384,9 +2384,9 @@ Operations teams can follow `docs/operations_alignment_checklist.md`, which link
 
 ## Deployment quick notes
 
-- **Direct uvicorn**: `uvicorn mcp_agent_mail.http:build_http_app --factory --host 0.0.0.0 --port 8765`
+- **Direct uvicorn**: `uvicorn mcp_agent_mail.http:create_app --factory --host 0.0.0.0 --port 8765`
 - **Python module**: `python -m mcp_agent_mail.http --host 0.0.0.0 --port 8765`
-- **Gunicorn**: `gunicorn -c deploy/gunicorn.conf.py mcp_agent_mail.http:build_http_app --factory`
+- **Gunicorn**: `gunicorn -c deploy/gunicorn.conf.py mcp_agent_mail.http:create_app --factory`
 - **Docker**: `docker compose up --build`
 
 ### CI/CD
