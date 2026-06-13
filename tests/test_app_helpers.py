@@ -71,22 +71,34 @@ def test_latest_filesystem_activity_returns_max(tmp_path) -> None:
 def test_latest_filesystem_activity_early_exits_on_recent(tmp_path) -> None:
     # The sweeper only needs to know whether *any* match is recent; once a
     # recent mtime is seen it must stop, not stat the rest of a 56k-file glob
-    # expansion on the event loop (#240). A non-existent trailing path would be
-    # statted (and skipped) only if the scan continued past the recent hit.
-    recent = tmp_path / "recent.txt"
-    recent.write_text("x", encoding="utf-8")
-    sentinel_unscanned = tmp_path / "would_raise_if_scanned"  # never created
-
+    # expansion on the event loop (#240). Prove the scan stops: the first file
+    # is recent (inside the grace window) but the second is *even more* recent.
+    # If the scan stopped at the first, the returned max is the first's mtime;
+    # if it kept going it would observe the larger second mtime instead.
     now = datetime.now(timezone.utc)
-    os.utime(recent, None)  # mtime = now
+    first_recent = tmp_path / "a_first_recent.txt"
+    second_more_recent = tmp_path / "b_more_recent.txt"
+    first_recent.write_text("x", encoding="utf-8")
+    second_more_recent.write_text("y", encoding="utf-8")
+
+    first_ts = (now - timedelta(seconds=100)).timestamp()
+    second_ts = now.timestamp()
+    os.utime(first_recent, (first_ts, first_ts))
+    os.utime(second_more_recent, (second_ts, second_ts))
     recent_after = now - timedelta(seconds=300)
 
     latest = _latest_filesystem_activity(
-        [recent, sentinel_unscanned], recent_after=recent_after
+        [first_recent, second_more_recent], recent_after=recent_after
     )
 
-    assert latest is not None
-    assert latest >= recent_after
+    # Returned the first (recent) mtime, NOT the larger second one -> stopped early.
+    assert latest == datetime.fromtimestamp(first_ts, tz=timezone.utc)
+    assert latest < datetime.fromtimestamp(second_ts, tz=timezone.utc)
+
+    # And without a recent_after window it must still scan all and return the max.
+    assert _latest_filesystem_activity(
+        [first_recent, second_more_recent]
+    ) == datetime.fromtimestamp(second_ts, tz=timezone.utc)
 
 
 def test_reservation_repo_pathspec_glob_and_exact(tmp_path) -> None:
