@@ -1306,39 +1306,104 @@ def _collect_matching_paths(base: Path, pattern: str) -> list[Path]:
     return [candidate]
 
 
-def _latest_filesystem_activity(paths: Sequence[Path]) -> Optional[datetime]:
-    mtimes: list[datetime] = []
+def _latest_filesystem_activity(
+    paths: Sequence[Path], *, recent_after: Optional[datetime] = None
+) -> Optional[datetime]:
+    """Latest mtime across ``paths``.
+
+    When ``recent_after`` is supplied, returns as soon as an mtime at or after
+    it is observed: the reservation is provably non-stale at that point, so
+    continuing to stat the rest (potentially tens of thousands of files under a
+    broad glob like ``frontend/**`` over ``node_modules``) only to refine an
+    answer that is already "recent" would needlessly block the event loop
+    (#240). The returned value is still the max seen so far, so an early return
+    never reports an mtime older than the true latest.
+    """
+    latest: Optional[datetime] = None
     for path in paths:
         try:
             stat = path.stat()
         except OSError:
             continue
-        mtimes.append(datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc))
-    if not mtimes:
-        return None
-    return max(mtimes)
+        mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        if latest is None or mtime > latest:
+            latest = mtime
+        if recent_after is not None and mtime >= recent_after:
+            return latest
+    return latest
 
 
-def _latest_git_activity(repo: Optional[Repo], matches: Sequence[Path]) -> Optional[datetime]:
-    if repo is None:
+def _reservation_repo_pathspec(
+    repo: Repo, workspace: Path, pattern: str
+) -> Optional[str]:
+    """Build a single repo-root-relative git pathspec for a reservation pattern.
+
+    Glob patterns become ``:(glob)`` magic pathspecs so one ``git rev-list``
+    walk covers the whole reservation tree, instead of forking ``git`` once per
+    glob-matched file (the #240 outage: ``frontend/**`` over ``node_modules``
+    expanded to ~56k files → ~56k sequential forks per cleanup tick). Returns
+    ``None`` for virtual namespaces (no filesystem/git presence) or when the
+    workspace cannot be located inside the repo.
+    """
+    if _is_virtual_namespace(pattern):
         return None
-    repo_root = Path(repo.working_tree_dir or "").resolve()
-    commit_times: list[datetime] = []
-    for match in matches:
-        try:
-            rel_path = match.resolve().relative_to(repo_root)
-        except Exception:
-            continue
-        try:
-            commit = next(repo.iter_commits(paths=str(rel_path), max_count=1))
-        except StopIteration:
-            continue
-        except Exception:
-            continue
-        commit_times.append(datetime.fromtimestamp(commit.committed_date, tz=timezone.utc))
-    if not commit_times:
+    normalized = _normalize_pattern(pattern)
+    if not normalized:
         return None
-    return max(commit_times)
+    try:
+        repo_root = Path(repo.working_tree_dir or "").resolve()
+        workspace_rel = workspace.resolve().relative_to(repo_root).as_posix()
+    except Exception:
+        return None
+    rel = normalized if workspace_rel in ("", ".") else f"{workspace_rel}/{normalized}"
+    rel = rel.replace("\\", "/")
+    # `:(glob)` is required for `**`/`*` to span directory boundaries the same
+    # way the pathlib glob expansion (`_collect_matching_paths`) does.
+    return f":(glob){rel}" if _contains_glob(normalized) else rel
+
+
+def _latest_git_activity(repo: Optional[Repo], pathspec: Optional[str]) -> Optional[datetime]:
+    """Latest commit time touching the reservation tree, via a SINGLE rev walk.
+
+    ``git rev-list --max-count=1 -- <pathspec>`` returns the most recent commit
+    touching any path under the (glob) pathspec; its committed time equals the
+    max across every matched file — identical to the old per-file ``max(...)``
+    but with one ``git`` fork instead of one per matched file (#240).
+    """
+    if repo is None or not pathspec:
+        return None
+    try:
+        commit = next(repo.iter_commits(paths=pathspec, max_count=1))
+    except StopIteration:
+        return None
+    except Exception:
+        return None
+    return datetime.fromtimestamp(commit.committed_date, tz=timezone.utc)
+
+
+def _compute_reservation_activity(
+    workspace: Optional[Path],
+    repo: Optional[Repo],
+    pattern: str,
+    *,
+    recent_after: Optional[datetime],
+) -> tuple[bool, Optional[datetime], Optional[datetime]]:
+    """Blocking filesystem+git activity probe for one reservation.
+
+    Returns ``(matched, fs_activity, git_activity)``. Kept fully synchronous so
+    the async sweeper can run it via ``asyncio.to_thread`` — even a pathological
+    workspace (huge glob expansion) then stays off the event loop entirely
+    (#240).
+    """
+    if workspace is None:
+        return False, None, None
+    matches = _collect_matching_paths(workspace, pattern)
+    if not matches:
+        return False, None, None
+    fs_activity = _latest_filesystem_activity(matches, recent_after=recent_after)
+    git_pathspec = _reservation_repo_pathspec(repo, workspace, pattern) if repo is not None else None
+    git_activity = _latest_git_activity(repo, git_pathspec)
+    return True, fs_activity, git_activity
 
 
 def _project_workspace_path(project: Project) -> Optional[Path]:
@@ -3972,15 +4037,23 @@ async def _collect_file_reservation_statuses(
                     send_map.get(agent_id), ack_map.get(agent_id), read_map.get(agent_id)
                 )
 
-            matches: list[Path] = []
+            matched = False
             fs_activity: Optional[datetime] = None
             git_activity: Optional[datetime] = None
 
             if workspace is not None:
-                matches = _collect_matching_paths(workspace, reservation.path_pattern)
-                if matches:
-                    fs_activity = _latest_filesystem_activity(matches)
-                    git_activity = _latest_git_activity(repo, matches)
+                # Offload the blocking filesystem+git probe to a thread so a
+                # broad glob reservation can never starve the event loop, and
+                # use a single glob-pathspec rev walk instead of one git fork
+                # per matched file (#240).
+                recent_after = moment - timedelta(seconds=activity_grace)
+                matched, fs_activity, git_activity = await asyncio.to_thread(
+                    _compute_reservation_activity,
+                    workspace,
+                    repo,
+                    reservation.path_pattern,
+                    recent_after=recent_after,
+                )
 
             agent_inactive = (
                 agent_last_active is None or (moment - agent_last_active).total_seconds() > inactivity_seconds
@@ -4012,7 +4085,7 @@ async def _collect_file_reservation_statuses(
                 reasons.append("mail_activity_recent")
             else:
                 reasons.append(f"no_recent_mail_activity>{activity_grace}s")
-            if matches:
+            if matched:
                 if recent_fs:
                     reasons.append("filesystem_activity_recent")
                 else:
