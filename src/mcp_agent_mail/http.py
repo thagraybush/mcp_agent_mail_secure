@@ -1439,8 +1439,23 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             finally:
                 await _shutdown()
 
-    # Now construct FastAPI with the composed lifespan so ASGI transports run it
-    fastapi_app = FastAPI(lifespan=lifespan_context)
+    # Now construct FastAPI with the composed lifespan so ASGI transports run it.
+    # Give the app a real title/version so the auto-generated /openapi.json has a
+    # proper `info` block (derive the version from installed package metadata,
+    # mirroring cli._package_version; never hardcode a value that could drift).
+    def _package_version() -> str:
+        import importlib.metadata as _importlib_metadata
+
+        try:
+            return _importlib_metadata.version("mcp-agent-mail")
+        except _importlib_metadata.PackageNotFoundError:  # pragma: no cover - dev installs
+            return "0.0.0+local"
+
+    fastapi_app = FastAPI(
+        title="MCP Agent Mail",
+        version=_package_version(),
+        lifespan=lifespan_context,
+    )
 
     # Simple request logging (configurable)
     if settings.http.request_log_enabled:
@@ -4188,6 +4203,41 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         with contextlib.suppress(Exception):
             structlog.get_logger("ui").error("ui_init_failed", error=str(exc))
         pass
+
+    # Keep the auto-generated /openapi.json focused on the real API contract.
+    # The browser-facing SSR mail UI (and its UI-backing JSON helpers) all live
+    # under the `/mail` prefix; they are registered for humans, not as part of
+    # the documented API surface, so we filter them out of the schema. The
+    # routes stay fully registered and functional — they are only omitted from
+    # the OpenAPI document. Using a custom app.openapi() (rather than
+    # include_in_schema=False on ~33 decorators) keeps this in one place and
+    # automatically covers any future /mail/* routes.
+    from fastapi.openapi.utils import get_openapi as _get_openapi
+
+    def _custom_openapi() -> dict[str, Any]:
+        if fastapi_app.openapi_schema:
+            return fastapi_app.openapi_schema
+        schema = _get_openapi(
+            title=fastapi_app.title,
+            version=fastapi_app.version,
+            openapi_version=fastapi_app.openapi_version,
+            description=fastapi_app.description,
+            routes=fastapi_app.routes,
+        )
+        paths = schema.get("paths")
+        if isinstance(paths, dict):
+            schema["paths"] = {
+                path: item
+                for path, item in paths.items()
+                if not (path == "/mail" or path.startswith("/mail/"))
+            }
+        fastapi_app.openapi_schema = schema
+        return schema
+
+    # Install the custom generator (FastAPI's documented extension point for
+    # overriding the OpenAPI document); cast keeps the bound-method override
+    # explicit for the type checker.
+    cast(Any, fastapi_app).openapi = _custom_openapi
 
     # Static web UI (SPA) routing support
     def _resolve_web_root() -> Path | None:
