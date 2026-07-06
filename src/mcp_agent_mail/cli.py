@@ -1208,6 +1208,17 @@ def serve_http(
     """Run the MCP server over the Streamable HTTP transport."""
     settings = get_settings()
 
+    if not settings.http.bearer_token:
+        import sys
+        print(
+            "ERROR: HTTP_BEARER_TOKEN is required.\n"
+            "Generate one and add it to your .env file:\n"
+            "  python3 -c \"import secrets; print(secrets.token_hex(32))\" >> .env\n"
+            "  # Then prefix with: HTTP_BEARER_TOKEN=",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
     # Enforce single-server ownership of the storage root (issue #123)
     _server_lock = _acquire_server_lock(settings)
 

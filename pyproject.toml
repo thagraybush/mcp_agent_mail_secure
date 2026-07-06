@@ -26,41 +26,24 @@ dependencies = [
   "fastmcp>=2.10.5",
   "uvicorn[standard]>=0.32.0",
   "fastapi>=0.110.0",
-  "PyYAML>=6.0.2",
-  "pathspec>=0.12.1",
-  "jinja2>=3.1.4",
-  "markdown2>=2.4.12",
-  "bleach>=6.1.0",
-  "tinycss2>=1.4.0",
   "python-decouple>=3.8",
   "sqlmodel>=0.0.16",
   "sqlalchemy[asyncio]>=2.0.35",
   "aiosqlite>=0.20.0",
-  "httpx[http2]>=0.27.2",
-  "aiolimiter>=1.1.0",
-  "tenacity>=8.3.0",
-  "redis[hiredis]>=5.3.0",
-  "rich>=13.9.1",
-  "typer>=0.15.0",
+  "httpx>=0.27.2",
   "structlog>=24.1.0",
   "orjson>=3.10.7,<4",
-  "tiktoken>=0.7.0",
-  "pillow>=10.4.0",
-  "GitPython>=3.1.43",
   "filelock>=3.16.0",
-  "jsonschema>=4.23.0",
-  "attrs>=24.2.0",
-  "authlib>=1.5.2,<1.6",
-  "litellm>=1.40.0,<2",
-  "ruff>=0.14.1",
-  "pynacl>=1.6.0",
-  "psutil>=6.1.1",
 ]
 
 [project.optional-dependencies]
-postgres = [
-  "asyncpg>=0.30.0",
-]
+cli = ["rich>=13.9.1", "typer>=0.15.0"]
+viewer = ["jinja2>=3.1.4", "markdown2>=2.4.12", "nh3>=0.2.14"]
+git = ["GitPython>=3.1.43", "pathspec>=0.12.1"]
+signing = ["pynacl>=1.6.0", "authlib>=1.5.2,<1.6"]
+redis = ["redis[hiredis]>=5.3.0"]
+postgres = ["asyncpg>=0.30.0"]
+all = ["mcp-agent-mail[cli,viewer,git,signing,redis]"]
 dev = [
   "ruff>=0.5.7",
   "mypy>=1.11.1",
