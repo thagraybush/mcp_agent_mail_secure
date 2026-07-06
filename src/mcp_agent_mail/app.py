@@ -5763,7 +5763,7 @@ def build_mcp_server() -> FastMCP:
               "environment": str,
               "http_host": str,
               "http_port": int,
-              "database_url": str
+              "database_backend": str
             }
 
         Examples
@@ -12180,7 +12180,7 @@ def build_mcp_server() -> FastMCP:
         dict
             {
               "environment": str,
-              "database_url": str,
+              "database_backend": str,
               "http": { "host": str, "port": int, "path": str }
             }
 
@@ -12192,7 +12192,7 @@ def build_mcp_server() -> FastMCP:
         """
         payload = {
             "environment": settings.environment,
-            "database_url": settings.database.url,
+            "database_backend": str(settings.database.url).split("://")[0].split("+")[0],
             "http": {
                 "host": settings.http.host,
                 "port": settings.http.port,

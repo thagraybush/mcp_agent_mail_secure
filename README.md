@@ -1,22 +1,38 @@
-# MCP Agent Mail
+# MCP Agent Mail (Strata Hardened Fork)
 
-![Agent Mail Showcase](screenshots/output/agent_mail_showcase.gif)
+Forked from [Dicklesworthstone/mcp_agent_mail](https://github.com/Dicklesworthstone/mcp_agent_mail)
 
-> "It's like gmail for your coding agents!"
-
-A mail-like coordination layer for coding agents, exposed as an HTTP-only FastMCP server. It gives agents memorable identities, an inbox/outbox, searchable message history, and voluntary file reservation "leases" to avoid stepping on each other.
+A mail-like coordination layer for coding agents, exposed as an HTTP-only FastMCP server. It gives agents memorable identities, an inbox/outbox, searchable message history, and voluntary file reservation “leases” to avoid stepping on each other.
 
 Think of it as asynchronous email + directory + change-intent signaling for your agents, backed by Git (for human-auditable artifacts) and SQLite (for indexing and queries).
 
 Status: Under active development. The design is captured in detail in `docs/planning/project_idea_and_guide.md` (start with the original prompt at the top of that file).
 
+## What this fork changes
+
+Two commits (`c46d510` security hardening + `e14efc6` fixes) on top of upstream:
+
+### Security hardening (PR #1, -23,706 lines)
+
+- Stripped ~23k lines of unused code: Beads integration, LiteLLM/tiktoken LLM layer, share/GitHub Pages publisher, viewer SPA + vendored WASM, agent-specific integration scripts (Cline, Cursor, Windsurf, Factory Droid, etc.), third-party docs, test artifacts
+- Dependency diet: core deps cut from 24 packages to 10 (redis, rich, typer, GitPython, jsonschema, authlib, pynacl, pillow, psutil, ruff all moved to optional extras or removed)
+- Security defaults: rate limiting on by default, absolute attachment paths blocked, file reservation cleanup disabled (opt-in), `.env.example` reduced to essential vars only
+- Replaced multi-vendor integration scripts with a single unified `scripts/integrate.sh` (Claude, Codex, Gemini)
+- Docker hardening: non-root user, pip install uses `--no-cache-dir`
+
+### Post-hardening fixes (`e14efc6`)
+
+- GitPython + pathspec moved from optional `git` extra to core deps (they’re required, not optional)
+- `health_check` endpoint no longer leaks the full `database_url` -- returns backend type only (e.g. `sqlite`)
+- HTML sanitizer migrated from `bleach` (deprecated) to `nh3`
+
 ## Why this exists
 
 Modern projects often run multiple coding agents at once (backend, frontend, scripts, infra). Without a shared coordination fabric, agents:
 
-- Overwrite each other's edits or panic on unexpected diffs
+- Overwrite each other’s edits or panic on unexpected diffs
 - Miss critical context from parallel workstreams
-- Require humans to "liaison" messages across tools and teams
+- Require humans to “liaison” messages across tools and teams
 
 This project provides a lightweight, interoperable layer so agents can:
 
@@ -26,7 +42,7 @@ This project provides a lightweight, interoperable layer so agents can:
 - Declare advisory file reservations (leases) on files/globs to signal intent
 - Inspect a directory of active agents, programs/models, and activity
 
-It's designed for: FastMCP clients and CLI tools (Claude Code, Codex, Gemini CLI, Factory Droid, etc.) coordinating across one or more codebases.
+It’s designed for: FastMCP clients and CLI tools (Claude Code, Codex, Gemini CLI, Factory Droid, etc.) coordinating across one or more codebases.
 
 ## From Idea Spark to Shipping Swarm
 
@@ -40,21 +56,12 @@ If a blank repo feels daunting, follow the field-tested workflow we documented i
 
 Watch the full 23-minute walkthrough (https://youtu.be/68VVcqMEDrs?si=pCm6AiJAndtZ6u7q) to see the loop in action.
 
-## Productivity Math & Automation Loop
-
-One disciplined hour of GPT-5 Codex—when it isn’t waiting on human prompts—often produces 10–20 “human hours” of work because the agents reason and type at machine speed. Agent Mail multiplies that advantage in two layers:
-
-1. **Base OSS server:** Git-backed mailboxes, advisory file reservations, Typer CLI helpers, and searchable archives keep independent agents aligned without babysitting. Every instruction, lease, and attachment is auditable.
-2. **Companion stack (commercial):** The iOS app + host automation can provision, pair, and steer heterogeneous fleets (Claude Code, Codex, Gemini CLI, Factory Droid, etc.) from your phone using customizable Message Stacks, Human Overseer broadcasts, Beads awareness, and plan editing tools—no manual tmux choreography required. The automation closes the loop by scheduling prompts, honoring Limited Mode, and enforcing Double-Arm confirmations for destructive work.
-
-Result: you invest 1–2 hours of human supervision, but dozens of agent-hours execute in parallel with clear audit trails and conflict-avoidance baked in.
-
 ## TLDR Quickstart
 
 ### One-line installer
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail/main/scripts/install.sh?$(date +%s)" | bash -s -- --yes
+curl -fsSL "https://raw.githubusercontent.com/thagraybush/mcp_agent_mail_secure/main/scripts/install.sh?$(date +%s)" | bash -s -- --yes
 ```
 
 What this does:
@@ -108,7 +115,7 @@ That's it! The `am` alias (added to your `.zshrc` or `.bashrc` during installati
 Install with custom port:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail/main/scripts/install.sh?$(date +%s)" | bash -s -- --port 9000 --yes
+curl -fsSL "https://raw.githubusercontent.com/thagraybush/mcp_agent_mail_secure/main/scripts/install.sh?$(date +%s)" | bash -s -- --port 9000 --yes
 ```
 
 Or use the CLI command after installation:
@@ -117,35 +124,14 @@ uv run python -m mcp_agent_mail.cli config set-port 9000
 
 ### If you want to do it yourself
 
-Clone the repo, set up and install with uv in a python 3.14 venv (install uv if you don't have it already), and then run `scripts/automatically_detect_all_installed_coding_agents_and_install_mcp_agent_mail_in_all.sh`. This will automatically set things up for your various installed coding agent tools and start the MCP server on port 8765. If you want to run the MCP server again in the future, simply run `scripts/run_server_with_token.sh`:
-
-Install uv (if you don't have it already):
-
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-
-# Clone the repo
-git clone https://github.com/Dicklesworthstone/mcp_agent_mail
-cd mcp_agent_mail
-
-# Create a Python 3.14 virtual environment and install dependencies
-# Note: If you have an older uv version, run `uv self update` first
-uv python install 3.14
-uv venv -p 3.14
-source .venv/bin/activate
+git clone https://github.com/thagraybush/mcp_agent_mail_secure
+cd mcp_agent_mail_secure
 uv sync
-
-# Detect installed coding agents, integrate, and start the MCP server on port 8765
-scripts/automatically_detect_all_installed_coding_agents_and_install_mcp_agent_mail_in_all.sh
-
-# Later, to run the MCP server again with the same token
-scripts/run_server_with_token.sh
-
-# Now, simply launch Codex-CLI or Claude Code or other agent tools in other consoles; they should have the mail tool available. See below for a ready-made chunk of text you can add to the end of your existing AGENTS.md or CLAUDE.md files to help your agents better utilize the new tools.
-
-# Change port after installation
-uv run python -m mcp_agent_mail.cli config set-port 9000
+cp .env.example .env
+# Edit .env and set HTTP_BEARER_TOKEN (generate with: python3 -c "import secrets; print(secrets.token_hex(32))")
+chmod 600 .env
+uv run python -m mcp_agent_mail.cli serve-http
 ```
 
 ## Ready-Made Blurb to Add to Your AGENTS.md or CLAUDE.md Files:
@@ -1974,7 +1960,7 @@ If port 8765 is already in use (e.g., by Cursor's Python extension), you can cha
 One-liner with custom port:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail/main/scripts/install.sh?$(date +%s)" | bash -s -- --port 9000 --yes
+curl -fsSL "https://raw.githubusercontent.com/thagraybush/mcp_agent_mail_secure/main/scripts/install.sh?$(date +%s)" | bash -s -- --port 9000 --yes
 ```
 
 Or with local script:
@@ -2526,7 +2512,7 @@ uv run python -m mcp_agent_mail.cli clear-and-reset-everything --force
 
 ## Client integrations
 
-Use the automated installer to wire up supported tools automatically (e.g., Claude Code, Cline, Windsurf, OpenCode). Run `scripts/automatically_detect_all_installed_coding_agents_and_install_mcp_agent_mail_in_all.sh` or the one-liner in the Quickstart above.
+Use the automated installer to wire up supported tools automatically (e.g., Claude Code, Codex, Gemini CLI). Run `./scripts/integrate.sh --all` or the one-liner in the Quickstart above.
 
 ### Tool-specific integration scripts
 

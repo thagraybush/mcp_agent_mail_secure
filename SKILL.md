@@ -380,7 +380,7 @@ Checks: stale locks, database integrity, orphaned records, FTS sync, expired res
 
 ```bash
 # One-liner (recommended)
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail/main/scripts/install.sh?$(date +%s)" | bash -s -- --yes
+curl -fsSL "https://raw.githubusercontent.com/thagraybush/mcp_agent_mail_secure/main/scripts/install.sh?$(date +%s)" | bash -s -- --yes
 
 # Custom port
 curl -fsSL ... | bash -s -- --port 9000 --yes
