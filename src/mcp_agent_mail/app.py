@@ -5783,7 +5783,7 @@ def build_mcp_server() -> FastMCP:
             "environment": settings.environment,
             "http_host": settings.http.host,
             "http_port": settings.http.port,
-            "database_url": settings.database.url,
+            "database_backend": str(settings.database.url).split("://")[0].split("+")[0],
         }
 
     @mcp.tool(name="ensure_project")
