@@ -34,16 +34,17 @@ dependencies = [
   "structlog>=24.1.0",
   "orjson>=3.10.7,<4",
   "filelock>=3.16.0",
+  "GitPython>=3.1.43",
+  "pathspec>=0.12.1",
 ]
 
 [project.optional-dependencies]
 cli = ["rich>=13.9.1", "typer>=0.15.0"]
 viewer = ["jinja2>=3.1.4", "markdown2>=2.4.12", "nh3>=0.2.14"]
-git = ["GitPython>=3.1.43", "pathspec>=0.12.1"]
 signing = ["pynacl>=1.6.0", "authlib>=1.5.2,<1.6"]
 redis = ["redis[hiredis]>=5.3.0"]
 postgres = ["asyncpg>=0.30.0"]
-all = ["mcp-agent-mail[cli,viewer,git,signing,redis]"]
+all = ["mcp-agent-mail[cli,viewer,signing,redis]"]
 dev = [
   "ruff>=0.5.7",
   "mypy>=1.11.1",

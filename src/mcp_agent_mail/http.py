@@ -1786,16 +1786,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
     # ----- Simple SSR Mail UI -----
     def _register_mail_ui() -> None:
-        import bleach
+        import nh3
         import markdown2
 
-        try:
-            from bleach.css_sanitizer import CSSSanitizer as _CSSSanitizerImport
-        except Exception:  # tinycss2 may be missing; degrade gracefully
-            _CSSSanitizer = None
-        else:
-            _CSSSanitizer = _CSSSanitizerImport
-        CSSSanitizer = cast(Any, _CSSSanitizer)
         from jinja2 import Environment, FileSystemLoader, select_autoescape
 
         templates_root = Path(__file__).resolve().parent / "templates"
@@ -1805,64 +1798,61 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             enable_async=True,
         )
         # HTML sanitizer (allow safe images and limited CSS)
-        _css_sanitizer = (
-            CSSSanitizer(
-                allowed_css_properties=["color", "background-color", "text-align", "text-decoration", "font-weight"]
+        _ALLOWED_TAGS = {
+            "a",
+            "abbr",
+            "acronym",
+            "b",
+            "blockquote",
+            "code",
+            "em",
+            "i",
+            "li",
+            "ol",
+            "ul",
+            "p",
+            "pre",
+            "strong",
+            "table",
+            "thead",
+            "tbody",
+            "tr",
+            "th",
+            "td",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "hr",
+            "br",
+            "span",
+            "img",
+        }
+        _ALLOWED_ATTRIBUTES: dict[str, set[str]] = {
+            "*": {"class"},
+            "a": {"href", "title", "rel"},
+            "abbr": {"title"},
+            "acronym": {"title"},
+            "code": {"class"},
+            "pre": {"class"},
+            "span": {"class", "style"},
+            "p": {"class", "style"},
+            "table": {"class", "style"},
+            "td": {"class", "style"},
+            "th": {"class", "style"},
+            "img": {"src", "alt", "title", "width", "height", "loading", "decoding", "class"},
+        }
+        _ALLOWED_URL_SCHEMES = {"http", "https", "mailto", "data"}
+
+        def _clean_html(html: str) -> str:
+            return nh3.clean(
+                html,
+                tags=_ALLOWED_TAGS,
+                attributes=_ALLOWED_ATTRIBUTES,
+                url_schemes=_ALLOWED_URL_SCHEMES,
             )
-            if CSSSanitizer
-            else None
-        )
-        _html_cleaner = bleach.Cleaner(
-            tags=[
-                "a",
-                "abbr",
-                "acronym",
-                "b",
-                "blockquote",
-                "code",
-                "em",
-                "i",
-                "li",
-                "ol",
-                "ul",
-                "p",
-                "pre",
-                "strong",
-                "table",
-                "thead",
-                "tbody",
-                "tr",
-                "th",
-                "td",
-                "h1",
-                "h2",
-                "h3",
-                "h4",
-                "h5",
-                "h6",
-                "hr",
-                "br",
-                "span",
-                "img",
-            ],
-            attributes={
-                "*": ["class"],
-                "a": ["href", "title", "rel"],
-                "abbr": ["title"],
-                "acronym": ["title"],
-                "code": ["class"],
-                "pre": ["class"],
-                "span": ["class", "style"],
-                "p": ["class", "style"],
-                "table": ["class", "style"],
-                "td": ["class", "style"],
-                "th": ["class", "style"],
-                "img": ["src", "alt", "title", "width", "height", "loading", "decoding", "class"],
-            },
-            protocols=["http", "https", "mailto", "data"],
-            strip=True,
-            css_sanitizer=_css_sanitizer,
-        )
 
         async def _render(name: str, **ctx: Any) -> HTMLResponse:
             tpl = env.get_template(name)
@@ -2878,7 +2868,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 else ""
             )
             if body_html:
-                body_html = _html_cleaner.clean(body_html)
+                body_html = _clean_html(body_html)
 
             # Get commit SHA for provenance badge
             commit_sha = None
@@ -3307,7 +3297,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             r["body_md"],
                             extras=["fenced-code-blocks", "tables", "strike", "cuddled-lists"]
                         )
-                        body_html = _html_cleaner.clean(body_html)
+                        body_html = _clean_html(body_html)
 
                     sender_display, sender_meta = _http_sender_identity(
                         message_project_id=pid,
