@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared helpers for setup/integration scripts
 # - Colorized logging (best-effort)
-# - Flags parsing: --yes, --dry-run, --quiet, --debug, --regenerate-token, --show-token, --project-dir
+# - Flags parsing: --yes, --dry-run, --quiet, --debug, --regenerate-token, --project-dir
 # - Dependency checks and traps
 # - Atomic writes and JSON validation
 # - Readiness polling and secure perms
@@ -28,14 +28,13 @@ log_ok()   { _print "${_grn}${1}${_rst}"; }
 log_warn() { _print "${_ylw}${1}${_rst}"; }
 log_err()  { _print "${_red}${1}${_rst}"; }
 
-# Parse common flags; sets globals: AUTO_YES, DRY_RUN, QUIET, DEBUG, REGENERATE_TOKEN, SHOW_TOKEN, PROJECT_DIR
+# Parse common flags; sets globals: AUTO_YES, DRY_RUN, QUIET, DEBUG, REGENERATE_TOKEN, PROJECT_DIR
 parse_common_flags() {
   AUTO_YES=${AUTO_YES:-0}
   DRY_RUN=${DRY_RUN:-0}
   QUIET=${QUIET:-0}
   DEBUG=${DEBUG:-0}
   REGENERATE_TOKEN=${REGENERATE_TOKEN:-0}
-  SHOW_TOKEN=${SHOW_TOKEN:-0}
   PROJECT_DIR=${PROJECT_DIR:-}
   local -a args=("$@");
   for ((i=0; i<${#args[@]}; i++)); do
@@ -46,12 +45,11 @@ parse_common_flags() {
       --quiet) QUIET=1 ;;
       --debug) DEBUG=1 ;;
       --regenerate-token) REGENERATE_TOKEN=1 ;;
-      --show-token) SHOW_TOKEN=1 ;;
       --project-dir) i=$((i+1)); PROJECT_DIR="${args[$i]:-}" ;;
       --project-dir=*) PROJECT_DIR="${a#*=}" ;;
     esac
   done
-  export AUTO_YES DRY_RUN QUIET DEBUG REGENERATE_TOKEN SHOW_TOKEN PROJECT_DIR
+  export AUTO_YES DRY_RUN QUIET DEBUG REGENERATE_TOKEN PROJECT_DIR
   if [[ "${DEBUG}" == "1" ]]; then set -x; fi
 }
 
@@ -196,7 +194,8 @@ generate_bearer_token() {
     [[ ${#token} -eq 64 ]] || token=""
   fi
   if [[ -z "$token" ]]; then
-    token="$(date +%s%N 2>/dev/null || date +%s)_$(hostname 2>/dev/null || echo host)"
+    log_err "Cannot generate secure token: openssl or python3 required"
+    return 1
   fi
   printf '%s\n' "$token"
 }
@@ -233,7 +232,8 @@ if [[ -z "${HTTP_BEARER_TOKEN:-}" ]]; then
   elif command -v uv >/dev/null 2>&1; then
     HTTP_BEARER_TOKEN="$(uv run python -c 'import secrets;print(secrets.token_hex(32))')"
   else
-    HTTP_BEARER_TOKEN="$(date +%s)_$(hostname 2>/dev/null || echo host)"
+    echo "ERROR: Cannot generate secure token. Install openssl or python3." >&2
+    exit 1
   fi
 fi
 export HTTP_BEARER_TOKEN
@@ -355,63 +355,6 @@ json_merge_mcp_server() {
 
   echo "$existing" | jq --arg name "$server_name" --argjson config "$server_config" \
     '.mcpServers = (.mcpServers // {}) | .mcpServers[$name] = $config'
-}
-
-# Return the Morph grep-only tool allowlist unless explicitly overridden.
-default_morph_enabled_tools() {
-  printf '%s\n' "${MORPH_ENABLED_TOOLS:-warpgrep_codebase_search,warpgrep_github_search}"
-}
-
-# Best-effort Morph API key discovery for CLI installers.
-# Priority:
-#   1) MORPH_API_KEY env var
-#   2) ~/.codex/config.toml
-#   3) ~/.gemini/settings.json
-#   4) ~/.claude/settings.json
-#   5) legacy ~/.claude.json
-resolve_morph_api_key() {
-  local key=""
-
-  if [[ -n "${MORPH_API_KEY:-}" ]]; then
-    printf '%s\n' "${MORPH_API_KEY}"
-    return 0
-  fi
-
-  if [[ -f "${HOME}/.codex/config.toml" ]]; then
-    key=$(sed -n 's/^MORPH_API_KEY = "\(.*\)"$/\1/p' "${HOME}/.codex/config.toml" | head -n 1)
-    if [[ -n "${key}" ]]; then
-      printf '%s\n' "${key}"
-      return 0
-    fi
-  fi
-
-  if command -v jq >/dev/null 2>&1; then
-    if [[ -f "${HOME}/.gemini/settings.json" ]]; then
-      key=$(jq -r '.mcpServers["morph-mcp"].env.MORPH_API_KEY // empty' "${HOME}/.gemini/settings.json" 2>/dev/null || true)
-      if [[ -n "${key}" ]]; then
-        printf '%s\n' "${key}"
-        return 0
-      fi
-    fi
-
-    if [[ -f "${HOME}/.claude/settings.json" ]]; then
-      key=$(jq -r '.mcpServers["morph-mcp"].env.MORPH_API_KEY // empty' "${HOME}/.claude/settings.json" 2>/dev/null || true)
-      if [[ -n "${key}" ]]; then
-        printf '%s\n' "${key}"
-        return 0
-      fi
-    fi
-
-    if [[ -f "${HOME}/.claude.json" ]]; then
-      key=$(jq -r '.mcpServers["morph-mcp"].env.MORPH_API_KEY // empty' "${HOME}/.claude.json" 2>/dev/null || true)
-      if [[ -n "${key}" ]]; then
-        printf '%s\n' "${key}"
-        return 0
-      fi
-    fi
-  fi
-
-  printf '\n'
 }
 
 # Append hook to existing hooks array without duplicating

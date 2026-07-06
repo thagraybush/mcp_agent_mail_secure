@@ -102,7 +102,7 @@ COPY src ./src
 RUN uv sync --no-dev
 
 # Defaults suitable for container
-ENV HTTP_HOST=0.0.0.0 \
+ENV HTTP_HOST=127.0.0.1 \
     STORAGE_ROOT=/data/mailbox
 
 EXPOSE 8765
