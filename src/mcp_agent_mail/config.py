@@ -395,7 +395,7 @@ def _build_settings() -> Settings:
         port=_i("HTTP_PORT", default=8765),
         path=decouple_config("HTTP_PATH", default="/api/"),
         bearer_token=decouple_config("HTTP_BEARER_TOKEN", default="") or None,
-        rate_limit_enabled=_b("HTTP_RATE_LIMIT_ENABLED", default=False),
+        rate_limit_enabled=_b("HTTP_RATE_LIMIT_ENABLED", default=True),
         rate_limit_per_minute=_i("HTTP_RATE_LIMIT_PER_MINUTE", default=60),
         rate_limit_backend=_enum(
             decouple_config("HTTP_RATE_LIMIT_BACKEND", default=""),
@@ -427,7 +427,7 @@ def _build_settings() -> Settings:
             "HTTP_RBAC_READONLY_TOOLS",
             default="health_check,fetch_inbox,whois,search_messages,summarize_thread",
         ),
-        allow_localhost_unauthenticated=_b("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", default=True),
+        allow_localhost_unauthenticated=_b("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", default=False),
     )
 
     database_settings = DatabaseSettings(
