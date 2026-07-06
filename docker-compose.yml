@@ -5,15 +5,17 @@ services:
     environment:
       POSTGRES_DB: agent_mail
       POSTGRES_USER: agent
-      POSTGRES_PASSWORD: agent
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}"
     volumes:
       - pgdata:/var/lib/postgresql/data
   server:
     build: .
-    ports:
-      - "8765:8765"
+    # Uncomment to expose externally (requires bearer token + reverse proxy with TLS)
+    # ports:
+    #   - "127.0.0.1:8765:8765"
     environment:
-      DATABASE_URL: postgres+asyncpg://agent:agent@db:5432/agent_mail
+      DATABASE_URL: "postgres+asyncpg://agent:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/agent_mail"
+      HTTP_BEARER_TOKEN: "${HTTP_BEARER_TOKEN:?Set HTTP_BEARER_TOKEN in .env}"
       STORAGE_ROOT: /data/archive
       TOOL_METRICS_EMIT_ENABLED: "true"
       TOOL_METRICS_EMIT_INTERVAL_SECONDS: "120"
