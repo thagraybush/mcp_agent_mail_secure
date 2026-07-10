@@ -6143,6 +6143,7 @@ def build_mcp_server() -> FastMCP:
             db_agent = await session.get(Agent, agent.id)
             if db_agent:
                 db_agent.retired_at = None
+                db_agent.last_active_ts = datetime.now(timezone.utc).replace(tzinfo=None)
                 session.add(db_agent)
                 await session.commit()
 

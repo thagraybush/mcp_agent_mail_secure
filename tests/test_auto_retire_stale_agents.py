@@ -19,6 +19,10 @@ from mcp_agent_mail.app import build_mcp_server, sweep_stale_agents
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.models import Agent
 
+# ---------------------------------------------------------------------------
+# STRATA-169: unretired agents must survive the next stale-agent sweep.
+# ---------------------------------------------------------------------------
+
 
 def _naive_utc(when: datetime | None = None) -> datetime:
     target = when or datetime.now(timezone.utc)
@@ -164,3 +168,76 @@ async def test_sweep_threshold_floor(isolated_env):
         # so the just-registered agent must still NOT retire.
         retired = await sweep_stale_agents(threshold_seconds=0)
         assert retired == []
+
+
+@pytest.mark.asyncio
+async def test_unretired_agent_survives_next_sweep(isolated_env):
+    """STRATA-169: unretire_agent must refresh last_active_ts so the agent
+    is not immediately re-retired by the next stale-agent sweep."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/unretiresurvive"})
+
+        reg = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "Unretiresurvive",
+                "program": "claude-code",
+                "model": "opus-4",
+                "name": "PhoenixAgent",
+                "task_description": "Will be retired then restored",
+            },
+        )
+        agent_name = reg.data["name"]
+        token = reg.data["registration_token"]
+
+        # Backdate last_active_ts to 3 days ago and retire the agent.
+        async with get_session() as session:
+            row = (
+                await session.execute(
+                    Agent.__table__.select().where(Agent.name == agent_name)
+                )
+            ).first()
+            assert row is not None
+            three_days_ago = _naive_utc(
+                datetime.now(timezone.utc) - timedelta(hours=72)
+            )
+            await session.execute(
+                Agent.__table__.update()
+                .where(Agent.id == row.id)
+                .values(last_active_ts=three_days_ago)
+            )
+            await session.commit()
+
+        # Retire via sweep (simulates the background worker catching it).
+        retired = await sweep_stale_agents(threshold_seconds=86400)
+        assert any(e["agent_name"] == agent_name for e in retired)
+
+        # Unretire via MCP tool — this must refresh last_active_ts.
+        result = await client.call_tool(
+            "unretire_agent",
+            {
+                "project_key": "Unretiresurvive",
+                "agent_name": agent_name,
+                "registration_token": token,
+            },
+        )
+        assert result.data["status"] == "active"
+
+        # Verify last_active_ts was refreshed to ~now, not still 3 days ago.
+        async with get_session() as session:
+            after = (
+                await session.execute(
+                    Agent.__table__.select().where(Agent.name == agent_name)
+                )
+            ).first()
+            assert after is not None
+            assert after.retired_at is None
+            age = _naive_utc() - after.last_active_ts
+            assert age.total_seconds() < 60, (
+                f"last_active_ts should be ~now after unretire, but is {age} old"
+            )
+
+        # Run the sweep again — agent must survive.
+        re_retired = await sweep_stale_agents(threshold_seconds=86400)
+        assert all(e["agent_name"] != agent_name for e in re_retired)
