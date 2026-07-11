@@ -2553,7 +2553,7 @@ async def _get_project_by_identifier(identifier: str) -> Project:
                 },
             )
 
-    slug = slugify(canonical_identifier)
+    slug = _compute_project_slug(canonical_identifier)
     async with get_session() as session:
         result = await session.execute(
             select(Project).where(
@@ -5157,12 +5157,12 @@ def build_mcp_server() -> FastMCP:
 
         stored_token = (agent.registration_token or "").strip()
         if not stored_token:
-            # Adjacent-agent auth for legacy tokenless agents: retire_agent
-            # and hard_delete_agent can be authorized by any other authenticated
-            # agent in the same project. This unsticks cleanup of pre-token
-            # agents without requiring direct SQL surgery. All other actions
-            # continue to require the target's own token.
-            if action in ("retire_agent", "hard_delete_agent"):
+            # Adjacent-agent auth for legacy tokenless agents: retire_agent,
+            # unretire_agent, and hard_delete_agent can be authorized by any
+            # other authenticated agent in the same project. This unsticks
+            # cleanup/recovery of pre-token agents without requiring direct
+            # SQL surgery. All other actions require the target's own token.
+            if action in ("retire_agent", "unretire_agent", "hard_delete_agent"):
                 peer = await _resolve_session_agent_for_project(ctx, project)
                 if peer is not None and peer.id != agent.id:
                     await ctx.info(
@@ -5177,7 +5177,7 @@ def build_mcp_server() -> FastMCP:
                     f"Agent '{agent.name}' does not have a registration token, so {action} cannot be authenticated. "
                     "Re-register or mint a token locally before retrying, or run this call from an MCP session "
                     "already authenticated as another agent in the same project (adjacent-agent auth is permitted "
-                    "for retire_agent and hard_delete_agent on tokenless legacy agents)."
+                    "for retire_agent, unretire_agent, and hard_delete_agent on tokenless legacy agents)."
                 ),
                 recoverable=True,
                 data={"agent_name": agent.name, "project_key": project.human_key, "action": action},
@@ -5896,6 +5896,7 @@ def build_mcp_server() -> FastMCP:
 
     @mcp.tool(name="register_agent")
     @_instrument_tool("register_agent", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="name", project_arg="project_key")
+    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
     async def register_agent(
         ctx: Context,
         project_key: str,
@@ -6596,12 +6597,18 @@ def build_mcp_server() -> FastMCP:
         project_key: str,
         agent_name: str,
         registration_token: Optional[str] = None,
+        viewer_name: Optional[str] = None,
+        viewer_token: Optional[str] = None,
         include_recent_commits: bool = True,
         commit_limit: int = 5,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Return enriched profile details for an agent, optionally including recent archive commits.
+
+        Peer lookup: pass viewer_name + viewer_token to authenticate as yourself
+        and look up another agent's profile. Without these, you can only look up
+        your own profile (self-whois via registration_token).
 
         Discovery
         ---------
@@ -6614,6 +6621,11 @@ def build_mcp_server() -> FastMCP:
             Project slug or human key.
         agent_name : str
             Agent name to look up (use resource://agents/{project_key} to discover names).
+        viewer_name : str, optional
+            Your own agent name (the one doing the lookup). When provided with
+            viewer_token, authenticates you as the viewer and returns the target's profile.
+        viewer_token : str, optional
+            Your registration token (the viewer's, not the target's).
         include_recent_commits : bool
             If true, include latest commits touching the project archive authored by the configured git author.
         commit_limit : int
@@ -6625,14 +6637,25 @@ def build_mcp_server() -> FastMCP:
             Agent profile augmented with { recent_commits: [{hexsha, summary, authored_ts}] } when requested.
         """
         project = await _get_project_by_identifier(project_key)
-        agent = await _authenticate_agent(
-            ctx,
-            project,
-            agent_name,
-            registration_token,
-            token_param="registration_token",
-            action="whois",
-        )
+        if viewer_name and viewer_token:
+            await _authenticate_agent(
+                ctx,
+                project,
+                viewer_name,
+                viewer_token,
+                token_param="viewer_token",
+                action="whois",
+            )
+            agent = await _get_agent(project, agent_name)
+        else:
+            agent = await _authenticate_agent(
+                ctx,
+                project,
+                agent_name,
+                registration_token,
+                token_param="registration_token",
+                action="whois",
+            )
         profile = _agent_to_dict(agent)
         recent: list[dict[str, Any]] = []
         if include_recent_commits:
@@ -8213,6 +8236,41 @@ def build_mcp_server() -> FastMCP:
                     summary_message="Message delivery failed for all target projects.",
                 )
             }
+
+        # Auto-renew approved contacts between sender and recipients so
+        # active communication pairs never silently expire.
+        if deliveries and sender and sender.id:
+            try:
+                settings_local = get_settings()
+                renew_delta = timedelta(seconds=settings_local.contact_auto_ttl_seconds)
+                new_expires = datetime.now(timezone.utc) + renew_delta
+                all_local_names = list(dict.fromkeys(
+                    (local_to or []) + (local_cc or []) + (local_bcc or [])
+                ))
+                if all_local_names:
+                    async with get_session() as s:
+                        recip_ids = (
+                            await s.execute(
+                                select(Agent.id).where(
+                                    cast(Any, Agent.project_id) == project.id,
+                                    Agent.name.in_(all_local_names),
+                                )
+                            )
+                        ).scalars().all()
+                        if recip_ids:
+                            await s.execute(
+                                update(AgentLink)
+                                .where(
+                                    cast(Any, AgentLink.a_agent_id) == sender.id,
+                                    AgentLink.b_agent_id.in_(recip_ids),
+                                    AgentLink.status == "approved",
+                                )
+                                .values(expires_ts=new_expires, updated_ts=datetime.now(timezone.utc))
+                            )
+                            await s.commit()
+            except Exception:
+                logger.debug("Contact auto-renewal failed (non-fatal)", exc_info=True)
+
         result: dict[str, Any] = {"deliveries": deliveries, "count": len(deliveries), "verified_sender": verified_sender}
         if delivery_errors:
             result["delivery_errors"] = delivery_errors
@@ -11133,6 +11191,7 @@ def build_mcp_server() -> FastMCP:
 
     @mcp.tool(name="file_reservation_paths")
     @_instrument_tool("file_reservation_paths", cluster=CLUSTER_FILE_RESERVATIONS, capabilities={"file_reservations", "repository"}, project_arg="project_key", agent_arg="agent_name")
+    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
     async def file_reservation_paths(
         ctx: Context,
         project_key: str,
@@ -11444,6 +11503,7 @@ def build_mcp_server() -> FastMCP:
 
     @mcp.tool(name="release_file_reservations")
     @_instrument_tool("release_file_reservations", cluster=CLUSTER_FILE_RESERVATIONS, capabilities={"file_reservations"}, project_arg="project_key", agent_arg="agent_name")
+    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
     async def release_file_reservations_tool(
         ctx: Context,
         project_key: str,
@@ -11597,6 +11657,7 @@ def build_mcp_server() -> FastMCP:
         project_arg="project_key",
         agent_arg="agent_name",
     )
+    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
     async def force_release_file_reservation(
         ctx: Context,
         project_key: str,
@@ -11813,6 +11874,7 @@ def build_mcp_server() -> FastMCP:
         return {"released": 1, "released_at": _iso(now), "reservation": summary}
     @mcp.tool(name="renew_file_reservations")
     @_instrument_tool("renew_file_reservations", cluster=CLUSTER_FILE_RESERVATIONS, capabilities={"file_reservations"}, project_arg="project_key", agent_arg="agent_name")
+    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
     async def renew_file_reservations(
         ctx: Context,
         project_key: str,
