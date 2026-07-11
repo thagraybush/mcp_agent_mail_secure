@@ -2251,6 +2251,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     if not agent:
                         raise HTTPException(status_code=404, detail="Agent not found")
                     agent.retired_at = None
+                    agent.last_active_ts = datetime.now(timezone.utc).replace(tzinfo=None)
                     session.add(agent)
                     await session.commit()
 
