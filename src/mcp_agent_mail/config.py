@@ -217,8 +217,8 @@ class Settings:
     contact_enforcement_enabled: bool
     # TTL for in-session auto-approved contact links and the
     # "recent contact" recency window used by messaging policy.
-    # Short by design (default 24h) — auto-approval is a session-scoped
-    # privilege.
+    # Default 30 days — short TTLs caused silent contact expiry in
+    # multi-agent governance buses.
     contact_auto_ttl_seconds: int
     # TTL for the *pending* contact-request fallback created by
     # send_message(auto_contact_if_blocked=True) when in-session
@@ -567,7 +567,7 @@ def _build_settings() -> Settings:
         log_level=decouple_config("LOG_LEVEL", default="INFO"),
         log_include_trace=_b("LOG_INCLUDE_TRACE", default=False),
         contact_enforcement_enabled=_b("CONTACT_ENFORCEMENT_ENABLED", default=True),
-        contact_auto_ttl_seconds=_i("CONTACT_AUTO_TTL_SECONDS", default=86400),
+        contact_auto_ttl_seconds=_i("CONTACT_AUTO_TTL_SECONDS", default=2592000),
         contact_pending_ttl_seconds=_i("CONTACT_PENDING_TTL_SECONDS", default=604800),
         contact_auto_retry_enabled=_b("CONTACT_AUTO_RETRY_ENABLED", default=True),
         log_json_enabled=_b("LOG_JSON_ENABLED", default=False),
@@ -583,7 +583,7 @@ def _build_settings() -> Settings:
         tool_metrics_emit_interval_seconds=_i("TOOL_METRICS_EMIT_INTERVAL_SECONDS", default=60),
         retention_report_enabled=_b("RETENTION_REPORT_ENABLED", default=False),
         retention_report_interval_seconds=_i("RETENTION_REPORT_INTERVAL_SECONDS", default=3600),
-        retention_max_age_days=_i("RETENTION_MAX_AGE_DAYS", default=180),
+        retention_max_age_days=_i("RETENTION_MAX_AGE_DAYS", default=5),
         quota_enabled=_b("QUOTA_ENABLED", default=False),
         quota_attachments_limit_bytes=_i("QUOTA_ATTACHMENTS_LIMIT_BYTES", default=0),
         quota_inbox_limit_count=_i("QUOTA_INBOX_LIMIT_COUNT", default=0),
