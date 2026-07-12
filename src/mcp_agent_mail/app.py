@@ -9871,12 +9871,53 @@ def build_mcp_server() -> FastMCP:
             f"macro_start_session prepared agent '{agent.name}' on project '{project.human_key}' "
             f"(file_reservations={len(file_reservations_result['granted']) if file_reservations_result else 0})."
         )
+
+        # Check for contacts expiring within 7 days
+        expiring_contacts: list[dict[str, Any]] = []
+        try:
+            now = _naive_utc()
+            expiry_horizon = now + timedelta(days=7)
+            async with get_session() as session:
+                # Query approved contacts involving this agent that expire within 7 days
+                link_rows = await session.execute(
+                    select(AgentLink).where(
+                        or_(
+                            cast(Any, AgentLink.a_agent_id) == agent.id,
+                            cast(Any, AgentLink.b_agent_id) == agent.id,
+                        ),
+                        cast(Any, AgentLink.status) == "approved",
+                        cast(Any, AgentLink.expires_ts).isnot(None),
+                        cast(Any, AgentLink.expires_ts) > now,
+                        cast(Any, AgentLink.expires_ts) <= expiry_horizon,
+                    )
+                )
+                expiring_links = link_rows.scalars().all()
+                # Resolve peer agent names
+                if expiring_links:
+                    peer_ids = set()
+                    for link in expiring_links:
+                        peer_id = link.b_agent_id if link.a_agent_id == agent.id else link.a_agent_id
+                        peer_ids.add(peer_id)
+                    peer_rows = await session.execute(
+                        select(Agent).where(cast(Any, Agent.id).in_(list(peer_ids)))
+                    )
+                    peer_map = {a.id: a.name for a in peer_rows.scalars().all()}
+                    for link in expiring_links:
+                        peer_id = link.b_agent_id if link.a_agent_id == agent.id else link.a_agent_id
+                        expiring_contacts.append({
+                            "peer": peer_map.get(peer_id, f"agent#{peer_id}"),
+                            "expires_ts": _iso(link.expires_ts),
+                        })
+        except Exception:
+            pass  # Non-critical; don't break the macro
+
         return {
             "project": _project_to_dict(project),
             "agent": _agent_to_dict(agent),
             "registration_token": token,
             "file_reservations": file_reservations_result or {"granted": [], "conflicts": []},
             "inbox": inbox_items,
+            "expiring_contacts": expiring_contacts,
         }
 
     @mcp.tool(name="macro_prepare_thread")
