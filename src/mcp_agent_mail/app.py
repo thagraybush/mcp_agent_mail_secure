@@ -5158,11 +5158,12 @@ def build_mcp_server() -> FastMCP:
         stored_token = (agent.registration_token or "").strip()
         if not stored_token:
             # Adjacent-agent auth for legacy tokenless agents: retire_agent,
-            # unretire_agent, and hard_delete_agent can be authorized by any
-            # other authenticated agent in the same project. This unsticks
-            # cleanup/recovery of pre-token agents without requiring direct
-            # SQL surgery. All other actions require the target's own token.
-            if action in ("retire_agent", "unretire_agent", "hard_delete_agent"):
+            # unretire_agent, hard_delete_agent, and reset_registration_token
+            # can be authorized by any other authenticated agent in the same
+            # project. This unsticks cleanup/recovery of pre-token agents
+            # without requiring direct SQL surgery. All other actions require
+            # the target's own token.
+            if action in ("retire_agent", "unretire_agent", "hard_delete_agent", "reset_registration_token"):
                 peer = await _resolve_session_agent_for_project(ctx, project)
                 if peer is not None and peer.id != agent.id:
                     await ctx.info(
@@ -5177,7 +5178,7 @@ def build_mcp_server() -> FastMCP:
                     f"Agent '{agent.name}' does not have a registration token, so {action} cannot be authenticated. "
                     "Re-register or mint a token locally before retrying, or run this call from an MCP session "
                     "already authenticated as another agent in the same project (adjacent-agent auth is permitted "
-                    "for retire_agent, unretire_agent, and hard_delete_agent on tokenless legacy agents)."
+                    "for retire_agent, unretire_agent, hard_delete_agent, and reset_registration_token on tokenless legacy agents)."
                 ),
                 recoverable=True,
                 data={"agent_name": agent.name, "project_key": project.human_key, "action": action},
@@ -6035,6 +6036,77 @@ def build_mcp_server() -> FastMCP:
         return result
 
     @mcp.tool(
+        name="list_agents",
+        description="List all registered agents in a project. Returns active and retired agent arrays with metadata. "
+        "Requires authentication as any registered agent in the project.",
+    )
+    @_instrument_tool("list_agents", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="agent_name", project_arg="project_key")
+    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
+    async def list_agents(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        registration_token: str,
+        include_retired: bool = False,
+    ) -> dict[str, Any]:
+        """List all registered agents in a project with unread counts."""
+        project = await _get_project_by_identifier(project_key)
+        if not project:
+            raise ValueError(f"Project '{project_key}' not found")
+
+        await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="list_agents",
+        )
+
+        async with get_session() as session:
+            # Get all agents in the project
+            result = await session.execute(
+                select(Agent).where(cast(Any, Agent.project_id == project.id)).order_by(desc(cast(Any, Agent.last_active_ts)))
+            )
+            agents = result.scalars().all()
+
+            # Get unread message counts for all agents in one query
+            unread_counts_stmt = (
+                select(
+                    MessageRecipient.agent_id,
+                    func.count(cast(Any, MessageRecipient.message_id)).label("unread_count"),
+                )
+                .where(
+                    cast(Any, MessageRecipient.read_ts).is_(None),
+                    cast(Any, MessageRecipient.agent_id).in_([agent.id for agent in agents]),
+                )
+                .group_by(MessageRecipient.agent_id)
+            )
+            unread_counts_result = await session.execute(unread_counts_stmt)
+            unread_counts_map = {row.agent_id: row.unread_count for row in unread_counts_result}
+
+            # Build agent data with unread counts, separating active and retired
+            active_data = []
+            retired_data = []
+            for agent in agents:
+                agent_dict = _agent_to_dict(agent)
+                agent_dict["unread_count"] = unread_counts_map.get(agent.id, 0)
+                if getattr(agent, "retired_at", None) is not None:
+                    retired_data.append(agent_dict)
+                else:
+                    active_data.append(agent_dict)
+
+        await ctx.info(f"list_agents: listed {len(active_data)} active, {len(retired_data)} retired agents in project '{project.human_key}'.")
+        return {
+            "project": {
+                "slug": project.slug,
+                "human_key": project.human_key,
+            },
+            "agents": active_data,
+            "retired_agents": retired_data if include_retired else [],
+        }
+
+    @mcp.tool(
         name="deregister_agent",
         description="Remove an agent from a project. Marks the agent as inactive and removes it from the active roster. "
         "Messages from/to the agent are preserved for audit but the agent can no longer send or receive new messages.",
@@ -6153,6 +6225,69 @@ def build_mcp_server() -> FastMCP:
             "status": "active",
             "agent_name": agent_name,
             "project_key": project_key,
+        }
+
+    @mcp.tool(
+        name="reset_registration_token",
+        description="Reset an agent's registration token via adjacent-agent vouching. "
+        "Another authenticated agent in the same project vouches for the target, "
+        "allowing token recovery when the original token is lost. Returns the new token.",
+    )
+    @_instrument_tool("reset_registration_token", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="target_agent_name", project_arg="project_key")
+    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
+    async def reset_registration_token(
+        ctx: Context,
+        project_key: str,
+        target_agent_name: str,
+        voucher_name: str,
+        voucher_token: str,
+        confirmation: str = "",
+    ) -> dict[str, Any]:
+        """Reset an agent's registration token via adjacent-agent vouching. Requires confirmation='I UNDERSTAND THIS RESETS THE TOKEN'."""
+        if confirmation != "I UNDERSTAND THIS RESETS THE TOKEN":
+            raise ToolExecutionError(
+                "CONFIRMATION_REQUIRED",
+                "reset_registration_token requires the confirmation parameter to be exactly "
+                "'I UNDERSTAND THIS RESETS THE TOKEN' (case-sensitive). "
+                "This operation invalidates the agent's existing token.",
+                recoverable=True,
+                data={"target_agent_name": target_agent_name, "project_key": project_key},
+            )
+
+        project = await _get_project_by_identifier(project_key)
+        if not project:
+            raise ValueError(f"Project '{project_key}' not found")
+
+        voucher = await _authenticate_agent(
+            ctx,
+            project,
+            voucher_name,
+            voucher_token,
+            token_param="voucher_token",
+            action="reset_registration_token",
+        )
+
+        target = await _get_agent(project, target_agent_name)
+
+        if voucher.id == target.id:
+            raise ToolExecutionError(
+                "SELF_VOUCH_NOT_ALLOWED",
+                "An agent cannot vouch for its own token reset. Use a different agent as voucher.",
+                recoverable=True,
+                data={"target_agent_name": target_agent_name, "voucher_name": voucher_name},
+            )
+
+        _target_agent, new_token = await _ensure_agent_registration_token(target, rotate=True)
+
+        await ctx.info(
+            f"reset_registration_token: agent '{voucher_name}' vouched for token reset of "
+            f"'{target_agent_name}' in project '{project.human_key}'."
+        )
+        return {
+            "status": "token_reset",
+            "agent_name": target_agent_name,
+            "registration_token": new_token,
+            "voucher": voucher_name,
         }
 
     @mcp.tool(
