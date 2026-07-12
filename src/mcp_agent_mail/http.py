@@ -25,8 +25,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import NoResultFound
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.types import Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .app import (
     _expire_stale_file_reservations,
@@ -664,17 +663,15 @@ def _jwks_candidate_keys(key_set, header: dict, algorithms: list[str]) -> list:
     return candidates
 
 
-class BearerAuthMiddleware(BaseHTTPMiddleware):
+class BearerAuthMiddleware:
+    """Pure ASGI bearer-token auth middleware (replaces BaseHTTPMiddleware)."""
+
     def __init__(
-        self, app: FastAPI, token: str, allow_localhost: bool = False, jwt_enabled: bool = False
+        self, app: ASGIApp, token: str, allow_localhost: bool = False, jwt_enabled: bool = False
     ) -> None:
-        super().__init__(app)
+        self.app = app
         self._token = token
         self._allow_localhost = allow_localhost
-        # When JWT auth is also enabled, a static-bearer mismatch must NOT
-        # short-circuit before the inner SecurityAndRateLimitMiddleware gets a
-        # chance to validate a JWT (#210). In that case we accept any Bearer
-        # token here and let the JWT path render the final auth decision.
         self._jwt_enabled = jwt_enabled
 
     @staticmethod
@@ -682,67 +679,82 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         """Check if host is a localhost address, including IPv4-mapped IPv6."""
         if not host:
             return False
-        # Standard localhost addresses
         if host in {"127.0.0.1", "::1", "localhost"}:
             return True
-        # IPv4-mapped IPv6 address (::ffff:127.0.0.1)
         return bool(host.lower().startswith("::ffff:") and host[7:] == "127.0.0.1")
 
     @staticmethod
-    def _has_forwarded_headers(request: Request) -> bool:
-        """Detect proxy-forwarded headers to avoid trusting localhost behind proxies."""
-        headers = request.headers
-        return any(
-            name in headers
-            for name in ("x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "forwarded")
-        )
+    def _has_forwarded_headers_from_scope(headers: list[tuple[bytes, bytes]]) -> bool:
+        """Detect proxy-forwarded headers from raw ASGI scope headers."""
+        forwarded_names = {b"x-forwarded-for", b"x-forwarded-proto", b"x-forwarded-host", b"forwarded"}
+        return any(name in forwarded_names for name, _ in headers)
 
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
-        if request.method == "OPTIONS":  # allow CORS preflight
-            return await call_next(request)
-        if request.url.path.startswith("/health/") or request.url.path == "/api/health":
-            return await call_next(request)
-        if _localhost_bypass_allowed(
-            request,
-            allow_localhost=self._allow_localhost,
-        ):
-            return await call_next(request)
-        auth_header = request.headers.get("Authorization", "")
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method", "")
+        path = scope.get("path", "")
+
+        if method == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+        if path.startswith("/health/") or path == "/api/health":
+            await self.app(scope, receive, send)
+            return
+
+        headers = scope.get("headers", [])
+        client = scope.get("client")
+        client_host = client[0] if client else ""
+
+        if self._allow_localhost and self._is_localhost(client_host) and not self._has_forwarded_headers_from_scope(headers):
+            await self.app(scope, receive, send)
+            return
+
+        auth_header = ""
+        for name, value in headers:
+            if name == b"authorization":
+                auth_header = value.decode("latin-1")
+                break
+
         expected_header = f"Bearer {self._token}"
-        # Use constant-time comparison to prevent timing attacks
         if hmac.compare_digest(auth_header, expected_header):
-            return await call_next(request)
-        # Static bearer did not match. If JWT auth is enabled, defer to the inner
-        # JWT-validating middleware instead of rejecting here, so EITHER a valid
-        # static bearer OR a valid JWT is accepted (#210).
+            await self.app(scope, receive, send)
+            return
+
         if self._jwt_enabled and auth_header.startswith("Bearer "):
-            return await call_next(request)
-        return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+            await self.app(scope, receive, send)
+            return
+
+        response = JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+        await response(scope, receive, send)
 
 
 def _localhost_bypass_allowed(request: Request, *, allow_localhost: bool) -> bool:
-    """Return whether this request qualifies for localhost auth bypass."""
+    """Return whether this request qualifies for localhost auth bypass (Request-based)."""
     if not allow_localhost:
         return False
     try:
         client_host = request.client.host if request.client else ""
     except Exception:
         client_host = ""
-    return BearerAuthMiddleware._is_localhost(client_host) and not BearerAuthMiddleware._has_forwarded_headers(
-        request
-    )
+    if not BearerAuthMiddleware._is_localhost(client_host):
+        return False
+    forwarded_names = {"x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "forwarded"}
+    return not any(name in request.headers for name in forwarded_names)
 
 
-class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
-    """JWT auth (optional), RBAC, and token-bucket rate limiting.
+class SecurityAndRateLimitMiddleware:
+    """Pure ASGI middleware for JWT auth, RBAC, and token-bucket rate limiting.
 
     - If JWT is enabled, validates Authorization: Bearer <token> using either HMAC secret or JWKS URL.
     - Enforces basic RBAC when enabled: read-only roles may only call whitelisted tools and resource reads.
     - Applies per-endpoint token-bucket limits (tools vs resources) with in-memory or Redis backend.
     """
 
-    def __init__(self, app: FastAPI, settings: Settings):
-        super().__init__(app)
+    def __init__(self, app: ASGIApp, settings: "Settings"):
+        self.app = app
         self.settings = settings
         self._jwt_enabled = bool(getattr(settings.http, "jwt_enabled", False))
         self._rbac_enabled = bool(getattr(settings.http, "rbac_enabled", True))
@@ -924,7 +936,11 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
         self._buckets[key] = (tokens, now)
         return True
 
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
         # Perform periodic cleanup of in-memory rate limit buckets
         if self._redis is None:
             now = self._monotonic()
@@ -932,51 +948,77 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
                 self._cleanup_buckets(now)
                 self._last_cleanup = now
 
+        method = scope.get("method", "")
+        path = scope.get("path", "")
+
         # Allow CORS preflight and health endpoints
-        if request.method == "OPTIONS" or request.url.path.startswith("/health/") or request.url.path == "/api/health":
-            return await call_next(request)
+        if method == "OPTIONS" or path.startswith("/health/") or path == "/api/health":
+            await self.app(scope, receive, send)
+            return
 
-        # Only read/patch body for POST requests. GET (including SSE) must not receive http.request messages.
+        # Read body for POST requests to classify the request
         body_bytes = b""
-        if request.method.upper() == "POST":
-            try:
-                body_bytes = await request.body()
-                body_sent = False
+        if method == "POST":
+            body_chunks: list[bytes] = []
+            while True:
+                message = await receive()
+                body_chunks.append(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
+            body_bytes = b"".join(body_chunks)
 
-                async def _receive() -> dict:
-                    nonlocal body_sent
-                    if body_sent:
-                        return {"type": "http.request", "body": b"", "more_body": False}
-                    body_sent = True
-                    return {"type": "http.request", "body": body_bytes, "more_body": False}
+            # Replay the buffered body for downstream
+            body_replayed = False
 
-                cast(Any, request)._receive = _receive
-            except Exception:
-                body_bytes = b""
+            async def _replay_receive() -> dict:
+                nonlocal body_replayed
+                if body_replayed:
+                    return {"type": "http.request", "body": b"", "more_body": False}
+                body_replayed = True
+                return {"type": "http.request", "body": body_bytes, "more_body": False}
 
-        kind, tool_name = self._classify_request(request.url.path, request.method, body_bytes)
+            receive = _replay_receive
+
+        headers = scope.get("headers", [])
+        client = scope.get("client")
+        client_host = client[0] if client else ""
+        allow_localhost = bool(getattr(self.settings.http, "allow_localhost_unauthenticated", False))
+
+        def _is_local_ok() -> bool:
+            if not allow_localhost:
+                return False
+            if not BearerAuthMiddleware._is_localhost(client_host):
+                return False
+            return not BearerAuthMiddleware._has_forwarded_headers_from_scope(headers)
+
+        kind, tool_name = self._classify_request(path, method, body_bytes)
+
+        # Extract auth header
+        auth_header = ""
+        for name, value in headers:
+            if name == b"authorization":
+                auth_header = value.decode("latin-1")
+                break
 
         # JWT auth (if enabled)
+        jwt_claims: dict[str, Any] | None = None
         if self._jwt_enabled:
-            auth_header = request.headers.get("Authorization", "")
-            # #210: when JWT is enabled, a valid *static* bearer is still accepted
-            # as the OR-alternative to a JWT (the outer BearerAuthMiddleware defers
-            # Bearer requests here without distinguishing the two). Check it first so
-            # static-bearer clients keep working once JWT is turned on; a static
-            # bearer is treated exactly as it is when JWT is disabled (default role).
             static_token = getattr(self.settings.http, "bearer_token", "") or ""
             if static_token and hmac.compare_digest(auth_header, f"Bearer {static_token}"):
                 roles = {self._default_role}
             else:
                 if not auth_header.startswith("Bearer "):
-                    return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+                    resp = JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+                    await resp(scope, receive, send)
+                    return
                 token = auth_header.split(" ", 1)[1].strip()
                 claims_dict = await self._decode_jwt(token)
                 if claims_dict is None:
-                    return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
-                claims = cast(dict[str, Any], claims_dict)
-                request.state.jwt_claims = claims
-                roles_raw = claims.get(self.settings.http.jwt_role_claim, [])
+                    resp = JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+                    await resp(scope, receive, send)
+                    return
+                jwt_claims = cast(dict[str, Any], claims_dict)
+                roles_raw = jwt_claims.get(self.settings.http.jwt_role_claim, [])
                 if isinstance(roles_raw, str):
                     roles = {roles_raw}
                 elif isinstance(roles_raw, (list, tuple)):
@@ -987,54 +1029,51 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
                     roles = {self._default_role}
         else:
             roles = {self._default_role}
-            # Elevate localhost to writer when unauthenticated localhost is allowed
-            if _localhost_bypass_allowed(
-                request,
-                allow_localhost=bool(getattr(self.settings.http, "allow_localhost_unauthenticated", False)),
-            ):
+            if _is_local_ok():
                 roles.add("writer")
 
+        # Store JWT claims in scope state for downstream access
+        if jwt_claims is not None:
+            scope.setdefault("state", {})["jwt_claims"] = jwt_claims
+
         # RBAC enforcement (skip for localhost when allowed)
-        is_local_ok = _localhost_bypass_allowed(
-            request,
-            allow_localhost=bool(getattr(self.settings.http, "allow_localhost_unauthenticated", False)),
-        )
-        if self._rbac_enabled and not is_local_ok and kind in {"tools", "resources"}:
+        is_local = _is_local_ok()
+        if self._rbac_enabled and not is_local and kind in {"tools", "resources"}:
             is_reader = bool(roles & self._reader_roles)
             is_writer = bool(roles & self._writer_roles) or (not roles)
-            if kind == "resources":
-                pass  # readers allowed
-            elif kind == "tools":
+            if kind == "tools":
                 if not tool_name:
-                    # Without name, assume write-required to be safe
                     if not is_writer:
-                        return JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+                        resp = JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+                        await resp(scope, receive, send)
+                        return
                 else:
                     if tool_name in self._readonly_tools:
                         if not is_reader and not is_writer:
-                            return JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+                            resp = JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+                            await resp(scope, receive, send)
+                            return
                     else:
                         if not is_writer:
-                            return JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+                            resp = JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+                            await resp(scope, receive, send)
+                            return
 
         # Rate limiting
         if self.settings.http.rate_limit_enabled:
             rpm, burst = self._rate_limits_for(kind)
-            identity = request.client.host if request.client else "ip-unknown"
-            # Prefer stable subject from JWT if present
-            with contextlib.suppress(Exception):
-                maybe_claims = getattr(request.state, "jwt_claims", None)
-                if isinstance(maybe_claims, dict):
-                    sub = maybe_claims.get("sub")
-                    if isinstance(sub, str) and sub:
-                        identity = f"sub:{sub}"
+            identity = client_host or "ip-unknown"
+            if jwt_claims and isinstance(jwt_claims.get("sub"), str) and jwt_claims["sub"]:
+                identity = f"sub:{jwt_claims['sub']}"
             endpoint = tool_name or "*"
             key = f"{kind}:{endpoint}:{identity}"
             allowed = await self._consume_bucket(key, rpm, burst)
             if not allowed:
-                return JSONResponse({"detail": "Rate limit exceeded"}, status_code=status.HTTP_429_TOO_MANY_REQUESTS)
+                resp = JSONResponse({"detail": "Rate limit exceeded"}, status_code=status.HTTP_429_TOO_MANY_REQUESTS)
+                await resp(scope, receive, send)
+                return
 
-        return await call_next(request)
+        await self.app(scope, receive, send)
 
 
 async def readiness_check() -> None:
@@ -1457,28 +1496,41 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         lifespan=lifespan_context,
     )
 
-    # Simple request logging (configurable)
+    # Simple request logging (configurable) — pure ASGI
     if settings.http.request_log_enabled:
         import time as _time
 
-        class RequestLoggingMiddleware(BaseHTTPMiddleware):
-            async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
+        class RequestLoggingMiddleware:
+            def __init__(self, app: ASGIApp) -> None:
+                self.app = app
+
+            async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+                if scope["type"] != "http":
+                    await self.app(scope, receive, send)
+                    return
+
                 start = _time.time()
-                method = request.method
-                path = request.url.path
-                client = request.client.host if request.client else "-"
-                response = None
+                method = scope.get("method", "")
+                path = scope.get("path", "")
+                client_tuple = scope.get("client")
+                client = client_tuple[0] if client_tuple else "-"
+                status_code = 0
                 exc: BaseException | None = None
+
+                async def _send_wrapper(message: dict) -> None:
+                    nonlocal status_code
+                    if message["type"] == "http.response.start":
+                        status_code = message.get("status", 0)
+                    await send(message)
+
                 try:
-                    response = await call_next(request)
-                    return response
+                    await self.app(scope, receive, _send_wrapper)
                 except BaseException as err:
                     exc = err
+                    status_code = status_code or 500
                     raise
                 finally:
-                    # Always emit a log line, even when the handler raised (#215).
                     dur_ms = int((_time.time() - start) * 1000)
-                    status_code = getattr(response, "status_code", 0) if response is not None else 500
                     with contextlib.suppress(Exception):
                         log = structlog.get_logger("http")
                         if exc is not None:
