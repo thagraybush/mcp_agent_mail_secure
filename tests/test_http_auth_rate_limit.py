@@ -13,12 +13,13 @@ def _rpc(method: str, params: dict) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_http_jwt_rbac_and_rate_limit(monkeypatch):
+async def test_http_jwt_rbac_and_rate_limit(isolated_env, monkeypatch):
     # Configure bearer auth and RBAC
     monkeypatch.setenv("HTTP_BEARER_TOKEN", "token123")
     monkeypatch.setenv("HTTP_RBAC_ENABLED", "true")
     monkeypatch.setenv("HTTP_RBAC_READER_ROLES", "reader")
     monkeypatch.setenv("HTTP_RBAC_WRITER_ROLES", "writer")
+    monkeypatch.setenv("HTTP_RBAC_DEFAULT_ROLE", "reader")
     # Enable rate limiting with small threshold
     monkeypatch.setenv("HTTP_RATE_LIMIT_ENABLED", "true")
     monkeypatch.setenv("HTTP_RATE_LIMIT_TOOLS_PER_MINUTE", "2")

@@ -140,7 +140,10 @@ async def test_http_readiness_endpoint(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_http_lock_status_endpoint(isolated_env):
+async def test_http_lock_status_endpoint(isolated_env, monkeypatch):
+    monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true")
+    with contextlib.suppress(Exception):
+        _config.clear_settings_cache()
     server = build_mcp_server()
     settings = _config.get_settings()
     app = build_http_app(settings, server)

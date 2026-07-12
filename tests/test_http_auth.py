@@ -405,8 +405,11 @@ class TestOAuthMetadataEndpoints:
     """Test OAuth metadata endpoint responses."""
 
     @pytest.mark.asyncio
-    async def test_oauth_metadata_root_returns_404(self, isolated_env):
+    async def test_oauth_metadata_root_returns_404(self, isolated_env, monkeypatch):
         """OAuth metadata endpoint returns 404 so clients skip OAuth discovery."""
+        monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true")
+        with contextlib.suppress(Exception):
+            _config.clear_settings_cache()
         settings = _config.get_settings()
         server = build_mcp_server()
         app = build_http_app(settings, server)
@@ -419,8 +422,11 @@ class TestOAuthMetadataEndpoints:
             assert data.get("mcp_oauth") is False
 
     @pytest.mark.asyncio
-    async def test_oauth_metadata_mcp_returns_404(self, isolated_env):
+    async def test_oauth_metadata_mcp_returns_404(self, isolated_env, monkeypatch):
         """OAuth metadata MCP endpoint returns 404 so clients skip OAuth discovery."""
+        monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true")
+        with contextlib.suppress(Exception):
+            _config.clear_settings_cache()
         settings = _config.get_settings()
         server = build_mcp_server()
         app = build_http_app(settings, server)
@@ -433,8 +439,11 @@ class TestOAuthMetadataEndpoints:
             assert data.get("mcp_oauth") is False
 
     @pytest.mark.asyncio
-    async def test_oauth_metadata_prefixed_mount_returns_404(self, isolated_env):
+    async def test_oauth_metadata_prefixed_mount_returns_404(self, isolated_env, monkeypatch):
         """Mounted transport paths should not expose accidental OAuth metadata."""
+        monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true")
+        with contextlib.suppress(Exception):
+            _config.clear_settings_cache()
         settings = _config.get_settings()
         server = build_mcp_server()
         app = build_http_app(settings, server)
@@ -447,8 +456,11 @@ class TestOAuthMetadataEndpoints:
             assert data.get("mcp_oauth") is False
 
     @pytest.mark.asyncio
-    async def test_oauth_metadata_suffix_probe_returns_404(self, isolated_env):
+    async def test_oauth_metadata_suffix_probe_returns_404(self, isolated_env, monkeypatch):
         """Codex-style suffix probes should also terminate OAuth discovery cleanly."""
+        monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true")
+        with contextlib.suppress(Exception):
+            _config.clear_settings_cache()
         settings = _config.get_settings()
         server = build_mcp_server()
         app = build_http_app(settings, server)
@@ -471,9 +483,12 @@ class TestOAuthMetadataEndpoints:
         ],
     )
     async def test_oauth_metadata_prefixed_trailing_slash_paths_return_404(
-        self, isolated_env, path: str
+        self, isolated_env, monkeypatch, path: str
     ):
         """Mounted trailing-slash probe paths should not fall through into the MCP transport."""
+        monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true")
+        with contextlib.suppress(Exception):
+            _config.clear_settings_cache()
         settings = _config.get_settings()
         server = build_mcp_server()
         app = build_http_app(settings, server)

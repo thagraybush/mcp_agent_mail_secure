@@ -103,6 +103,7 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_AUTHOR_NAME", "test-agent")
     monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@example.com")
     monkeypatch.setenv("INLINE_IMAGE_MAX_BYTES", "128")
+    monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true")
     clear_settings_cache()
     reset_database_state()
     # Clear repo cache before test to ensure isolation

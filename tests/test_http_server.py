@@ -532,6 +532,10 @@ class TestHTTPLockScope:
 
     @pytest.mark.asyncio
     async def test_overseer_send_archives_after_db_session_closes(self, isolated_env, monkeypatch):
+        monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true")
+        with contextlib.suppress(Exception):
+            _config.clear_settings_cache()
+
         import mcp_agent_mail.http as http_module
         import mcp_agent_mail.storage as storage_module
         from mcp_agent_mail.db import get_session as real_get_session
@@ -597,6 +601,10 @@ class TestHTTPLockScope:
 
     @pytest.mark.asyncio
     async def test_delete_messages_archives_after_db_session_closes(self, isolated_env, monkeypatch):
+        monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true")
+        with contextlib.suppress(Exception):
+            _config.clear_settings_cache()
+
         import mcp_agent_mail.http as http_module
         from mcp_agent_mail.db import get_session as real_get_session
         from mcp_agent_mail.models import Agent, Message, MessageRecipient, Project
@@ -692,6 +700,10 @@ class TestHTTPLockScope:
 
     @pytest.mark.asyncio
     async def test_inbox_delete_archives_after_db_session_closes(self, isolated_env, monkeypatch):
+        monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true")
+        with contextlib.suppress(Exception):
+            _config.clear_settings_cache()
+
         import mcp_agent_mail.http as http_module
         from mcp_agent_mail.db import get_session as real_get_session
         from mcp_agent_mail.models import Agent, Message, MessageRecipient, Project
