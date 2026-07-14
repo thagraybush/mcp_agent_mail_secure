@@ -49,7 +49,7 @@ jobs:
         shell: bash
         run: |
           uv lock
-          uv sync --dev
+          uv sync --dev --extra all
 
       - name: Lint (ruff)
         shell: bash
