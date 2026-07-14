@@ -53,7 +53,7 @@ jobs:
       - name: Lint (ruff)
         shell: bash
         run: |
-          uv run ruff check
+          uvx ruff check
 
       - name: Type check
         shell: bash
