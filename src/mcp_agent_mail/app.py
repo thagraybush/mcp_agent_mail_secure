@@ -390,6 +390,38 @@ def _record_recent(tool_name: str, project: Optional[str], agent: Optional[str])
     RECENT_TOOL_USAGE.append((datetime.now(timezone.utc), tool_name, project, agent))
 
 
+def _init_capability_rbac() -> None:
+    """Initialize STRATA-215 capability RBAC from permission matrix (if configured)."""
+    try:
+        from mcp_agent_mail import capability_rbac
+        if capability_rbac.init():
+            mode = "enforce" if capability_rbac.is_enforcing() else "log-only"
+            logger.info("capability_rbac: initialized (%s mode)", mode)
+    except Exception:
+        logger.debug("capability_rbac: not initialized (no matrix path configured)")
+
+
+def _capability_rbac_loaded() -> bool:
+    try:
+        from mcp_agent_mail import capability_rbac
+        return capability_rbac.is_loaded()
+    except Exception:
+        return False
+
+
+def _capability_rbac_enforcing() -> bool:
+    try:
+        from mcp_agent_mail import capability_rbac
+        return capability_rbac.is_enforcing()
+    except Exception:
+        return False
+
+
+def _check_capability_rbac(tool_name: str, agent_name: str):
+    from mcp_agent_mail import capability_rbac
+    return capability_rbac.check_and_log(tool_name, agent_name)
+
+
 def _instrument_tool(
     tool_name: str,
     *,
@@ -444,6 +476,18 @@ def _instrument_tool(
                 _enforce_capabilities(ctx, required_caps, tool_name)
             project_value = _extract_argument(bound, project_arg)
             agent_value = _extract_argument(bound, agent_arg)
+
+            # STRATA-215 Phase 2b: capability-level RBAC check
+            if agent_value and _capability_rbac_loaded():
+                _cap_decision = _check_capability_rbac(tool_name, str(agent_value))
+                if not _cap_decision.allowed and _capability_rbac_enforcing():
+                    metrics["errors"] += 1
+                    raise ToolExecutionError(
+                        "FORBIDDEN",
+                        f"Capability denied: {_cap_decision.reason}",
+                        recoverable=False,
+                        data={"tool": tool_name, "agent": str(agent_value), "role": _cap_decision.role},
+                    )
 
             # Rich logging: Log tool call start if enabled
             settings = get_settings()
@@ -779,6 +823,7 @@ def _lifespan_factory(settings: Settings) -> Callable[[FastMCP], AsyncContextMan
     @asynccontextmanager
     async def lifespan(app: FastMCP) -> AsyncIterator[None]:
         init_engine(settings)
+        _init_capability_rbac()
         heal_summary = await heal_archive_locks(settings)
         if heal_summary.get("locks_removed") or heal_summary.get("metadata_removed"):
             logger.info(

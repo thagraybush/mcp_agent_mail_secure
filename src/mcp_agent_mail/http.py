@@ -1838,9 +1838,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
     # ----- Simple SSR Mail UI -----
     def _register_mail_ui() -> None:
-        import nh3
         import markdown2
-
+        import nh3
         from jinja2 import Environment, FileSystemLoader, select_autoescape
 
         templates_root = Path(__file__).resolve().parent / "templates"

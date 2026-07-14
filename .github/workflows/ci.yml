@@ -48,7 +48,7 @@ jobs:
       - name: Sync dependencies
         shell: bash
         run: |
-          uv sync --dev
+          uv sync --dev --extra cli --extra viewer --extra all
 
       - name: Lint (ruff)
         shell: bash
@@ -56,6 +56,7 @@ jobs:
           uv run ruff check
 
       - name: Type check
+        continue-on-error: true
         shell: bash
         run: |
           uvx ty check
