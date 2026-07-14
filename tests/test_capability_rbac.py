@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
 from mcp_agent_mail.capability_rbac import (
-    CapabilityDecision,
     check_and_log,
     check_capability,
     init,
@@ -274,5 +272,5 @@ class TestCheckAndLog:
         init(matrix_file)
         with mock.patch.dict("os.environ", {"AGENT_MAIL_CAPABILITY_RBAC_ENFORCE": "true"}):
             with caplog.at_level("WARNING"):
-                decision = check_and_log("register_agent", "GentleAnchor")
+                check_and_log("register_agent", "GentleAnchor")
             assert any("DENIED" in r.message and "WOULD" not in r.message for r in caplog.records)

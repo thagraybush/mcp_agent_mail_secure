@@ -91,9 +91,7 @@ def is_enforcing() -> bool:
     env = os.environ.get("AGENT_MAIL_CAPABILITY_RBAC_ENFORCE", "").lower()
     if env == "true":
         return True
-    if _MATRIX and _MATRIX.get("enforcement_mode") == "enforce":
-        return True
-    return False
+    return bool(_MATRIX and _MATRIX.get("enforcement_mode") == "enforce")
 
 
 def resolve_role(agent_name: str) -> str | None:

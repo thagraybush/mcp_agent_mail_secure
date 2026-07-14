@@ -417,7 +417,7 @@ def _capability_rbac_enforcing() -> bool:
         return False
 
 
-def _check_capability_rbac(tool_name: str, agent_name: str) -> "capability_rbac.CapabilityDecision":
+def _check_capability_rbac(tool_name: str, agent_name: str):
     from mcp_agent_mail import capability_rbac
     return capability_rbac.check_and_log(tool_name, agent_name)
 
