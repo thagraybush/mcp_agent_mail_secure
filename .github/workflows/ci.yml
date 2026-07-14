@@ -48,8 +48,7 @@ jobs:
       - name: Sync dependencies
         shell: bash
         run: |
-          uv lock
-          uv sync --dev --extra all
+          uv sync --dev --extra cli --extra viewer --extra all
 
       - name: Lint (ruff)
         shell: bash
