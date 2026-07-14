@@ -92,6 +92,9 @@ ignore = [
 known-first-party = ["mcp_agent_mail"]
 combine-as-imports = true
 
+[tool.ty]
+exclude = ["src/mcp_agent_mail/app.py"]
+
 [tool.mypy]
 python_version = "3.12"
 warn_return_any = true
