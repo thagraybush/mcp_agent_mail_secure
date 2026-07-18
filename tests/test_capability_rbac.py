@@ -9,7 +9,6 @@ from unittest import mock
 import pytest
 
 from mcp_agent_mail.capability_rbac import (
-    CapabilityDecision,
     check_and_log,
     check_capability,
     get_agent_capabilities,
